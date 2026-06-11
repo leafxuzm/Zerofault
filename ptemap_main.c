@@ -21,6 +21,10 @@ static int target_pid;
 module_param(target_pid, int, 0644);
 MODULE_PARM_DESC(target_pid, "Target process PID for access control (0 = any process, default: 0)");
 
+static int use_direct_pte;
+module_param(use_direct_pte, int, 0644);
+MODULE_PARM_DESC(use_direct_pte, "Use PTE direct write (1) instead of vm_insert_page (0, default)");
+
 /* Global module state */
 struct ptemap_state g_state = {
 	.phys_pages = 256,
@@ -41,6 +45,7 @@ static int __init ptemap_init(void)
 	}
 	g_state.phys_pages = phys_pages;
 	g_state.target_pid = target_pid;
+	g_state.use_direct_pte = use_direct_pte;
 
 	/* [2] If target_pid specified, verify process exists */
 	if (target_pid > 0) {

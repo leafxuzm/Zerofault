@@ -36,6 +36,9 @@ struct ptemap_state {
 	/* debugfs */
 	struct dentry *debugfs_dir;
 
+	/* PTE direct write */
+	int use_direct_pte;
+
 	/* Stats */
 	unsigned long alloc_time_ns;
 	unsigned long tlb_flush_count;
@@ -45,10 +48,11 @@ extern struct ptemap_state g_state;
 
 /* ptemap_core.c */
 int ptemap_alloc_pages(void);
-int ptemap_build_ptes(void);
-void ptemap_clear_ptes(void);
 void ptemap_free_pages(void);
 void ptemap_free_single_page_range(int start, int nr);
+
+/* ptemap_pte.c — PTE 直写（apply_to_page_range + set_pte_at + pfn_pte） */
+int ptemap_mmap_direct(struct vm_area_struct *vma);
 
 /* ptemap_cdev.c */
 int ptemap_cdev_init(void);

@@ -59,6 +59,12 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	 * mremap from moving the mapping, DONTDUMP excludes from
 	 * core dumps (performance-sensitive memory).
 	 */
+	/* v1.1: PTE 直写路径 — apply_to_page_range + set_pte_at，完全绕过
+	 * vm_insert_page / remap_pfn_range，零 rmap 开销，逐页可独立 pgprot */
+	if (g_state.use_direct_pte)
+		return ptemap_mmap_direct(vma);
+
+	/* v1.0: vm_insert_page 路径（默认） */
 	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 

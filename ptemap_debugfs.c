@@ -18,6 +18,8 @@ static int ptemap_status_show(struct seq_file *m, void *v)
 		   g_state.vaddr_size,
 		   g_state.vaddr_size / (1024 * 1024));
 	seq_printf(m, "target_pid: %d\n", g_state.target_pid);
+		seq_printf(m, "direct_pte: %d (%s)\n", g_state.use_direct_pte,
+			   g_state.use_direct_pte ? "PTE direct write" : "vm_insert_page");
 	seq_printf(m, "vaddr:     0x%lx-0x%lx\n",
 		   g_state.vaddr_start, g_state.vaddr_end);
 	seq_printf(m, "tlb_flush: %lu\n", g_state.tlb_flush_count);
