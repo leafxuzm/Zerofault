@@ -9,6 +9,21 @@
 
 #define PTEMAP_MAX_PAGES 4096
 
+/* Cache strategy — maps to x86 PAT/PCD/PWT bits */
+enum ptemap_cache_mode {
+	PTEMAP_CACHE_WC = 0,  /* write-combining (default, PAT bit)   */
+	PTEMAP_CACHE_WB = 1,  /* write-back      (clear cache bits)   */
+	PTEMAP_CACHE_UC = 2,  /* uncacheable     (PCD+PWT bits)       */
+	PTEMAP_CACHE_WT = 3,  /* write-through   (PAT+PWT bits)       */
+	PTEMAP_CACHE_NR = 4,
+};
+
+/*
+ * Convert cache mode enum to pgprot_t.
+ * Base prot should come from vma->vm_page_prot.
+ */
+pgprot_t ptemap_cache_pgprot(enum ptemap_cache_mode mode, pgprot_t base);
+
 /* Global module state */
 struct ptemap_state {
 	/* Module parameters */
@@ -22,6 +37,10 @@ struct ptemap_state {
 	/* Physical pages */
 	struct page **pages;
 	unsigned long nr_pages;
+
+	/* Per-page cache strategy (indexed by page number) */
+	enum ptemap_cache_mode *page_cache;
+	pgprot_t *page_pgprot;   /* pre-computed pgprot for each page */
 
 	/* Virtual address range */
 	unsigned long vaddr_start;
@@ -48,6 +67,8 @@ extern struct ptemap_state g_state;
 
 /* ptemap_core.c */
 int ptemap_alloc_pages(void);
+int ptemap_alloc_cache_arrays(void);
+void ptemap_free_cache_arrays(void);
 void ptemap_free_pages(void);
 void ptemap_free_single_page_range(int start, int nr);
 

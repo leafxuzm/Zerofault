@@ -88,6 +88,13 @@ static int __init ptemap_init(void)
 	}
 	pr_info("ptemap: allocated %lu pages OK\n", g_state.nr_pages);
 
+	/* [3.5] Allocate per-page cache strategy arrays */
+	ret = ptemap_alloc_cache_arrays();
+	if (ret) {
+		pr_err("ptemap: cache array allocation failed\n");
+		goto err_cache;
+	}
+
 	/* [4] Register cdev */
 	ret = ptemap_cdev_init();
 	if (ret) {
@@ -107,6 +114,8 @@ static int __init ptemap_init(void)
 	return 0;
 
 err_cdev:
+	ptemap_free_cache_arrays();
+err_cache:
 	ptemap_free_pages();
 err_pages:
 	if (g_state.target_mm) {
@@ -139,6 +148,9 @@ static void __exit ptemap_exit(void)
 		put_task_struct(g_state.target_task);
 		g_state.target_task = NULL;
 	}
+
+	/* [3.5] Free cache strategy arrays */
+	ptemap_free_cache_arrays();
 
 	/* [4] Free physical pages */
 	ptemap_free_pages();
