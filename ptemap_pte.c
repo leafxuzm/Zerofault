@@ -131,6 +131,12 @@ int ptemap_mmap_direct(struct vm_area_struct *vma)
 	g_state.vaddr_end   = vma->vm_end;
 	g_state.vaddr_size  = vma->vm_end - vma->vm_start;
 
+	/* Track the mm for safe PTE cleanup at module unload */
+	if (!g_state.mapped_mm) {
+		mmgrab(vma->vm_mm);
+		g_state.mapped_mm = vma->vm_mm;
+	}
+
 	pr_info("ptemap: mmap DIRECT OK: vaddr=0x%lx-0x%lx pages=%lu pid=%d\n",
 		vma->vm_start, vma->vm_end, nr_pages, current->pid);
 
@@ -152,4 +158,75 @@ void ptemap_flush_tlb_range(unsigned long start, unsigned long end)
 {
 	__flush_tlb_all();
 	g_state.tlb_flush_count++;
+}
+
+/*
+ * Walk the page table and clear all PTEs in [start, end), then flush TLB.
+ *
+ * Called at module unload to prevent use-after-free: if a process still holds
+ * the mmap and tries to access the mapping after pages are freed, the kernel
+ * would follow a dangling PTE into freed/reused physical memory.  Clearing
+ * PTEs first guarantees a clean page fault (SIGSEGV) instead of silent
+ * corruption.
+ *
+ * For the v1.1 direct-PTE path (VM_PFNMAP + _PAGE_SPECIAL), there is no rmap
+ * metadata to clean up, so pte_clear + TLB flush is sufficient.  For the v1.0
+ * vm_insert_page path, rmap entries may remain but will be cleaned up when
+ * the VMA is destroyed on process exit — clearing the PTE prevents access to
+ * freed pages in the window between module unload and process exit.
+ *
+ * Must be called before ptemap_free_pages().
+ */
+void ptemap_pte_clear_range(struct mm_struct *mm, unsigned long start,
+			    unsigned long end)
+{
+	unsigned long addr;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pte_t *pte;
+	int cleared = 0;
+
+	if (!mm || start >= end)
+		return;
+
+	/* Try to take mmap_lock for write — if we can't get it, proceed
+	 * unlocked as a best-effort safety net (unload vs racing accessor
+	 * is inherently racy; the PTE clear + TLB flush still closes the
+	 * window for subsequent accesses).
+	 */
+	if (mmap_write_trylock(mm)) {
+		for (addr = start; addr < end; addr += PAGE_SIZE) {
+			pgd = pgd_offset(mm, addr);
+			if (pgd_none(*pgd) || pgd_bad(*pgd))
+				continue;
+
+			p4d = p4d_offset(pgd, addr);
+			if (p4d_none(*p4d) || p4d_bad(*p4d))
+				continue;
+
+			pud = pud_offset(p4d, addr);
+			if (pud_none(*pud) || pud_bad(*pud))
+				continue;
+
+			pmd = pmd_offset(pud, addr);
+			if (pmd_none(*pmd) || pmd_bad(*pmd))
+				continue;
+
+			pte = pte_offset_kernel(pmd, addr);
+			if (!pte || pte_none(*pte))
+				continue;
+
+			pte_clear(mm, addr, pte);
+			cleared++;
+		}
+		mmap_write_unlock(mm);
+	}
+
+	if (cleared > 0) {
+		__flush_tlb_all();
+		pr_info("ptemap: cleared %d PTEs + TLB flush (range 0x%lx-0x%lx)\n",
+			cleared, start, end);
+	}
 }

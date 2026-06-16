@@ -21,7 +21,7 @@ static const char * const cache_names[] = {
 static int ptemap_status_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "state:     LIVE\n");
-	seq_printf(m, "version:   1.3.0\n");
+	seq_printf(m, "version:   1.3.1\n");
 	seq_printf(m, "pages:     %lu (total)\n", g_state.nr_pages);
 	seq_printf(m, "size:      %lu bytes (%lu MB)\n",
 		   g_state.vaddr_size,

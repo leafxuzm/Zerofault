@@ -10,7 +10,7 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("PTE direct-mapping module for HFT low-latency memory access");
 MODULE_AUTHOR("Leaf Xu");
-MODULE_VERSION("1.3.0");
+MODULE_VERSION("1.3.1");
 
 /* Module parameters */
 static int phys_pages = 256;
@@ -35,7 +35,7 @@ static int __init ptemap_init(void)
 {
 	int ret;
 
-	pr_info("ptemap: loading v1.3.0\n");
+	pr_info("ptemap: loading v1.3.1\n");
 
 	/* [1] Validate and store parameters */
 	if (phys_pages <= 0 || phys_pages > PTEMAP_MAX_PAGES) {
@@ -133,13 +133,28 @@ static void __exit ptemap_exit(void)
 {
 	pr_info("ptemap: unloading...\n");
 
-	/* [1] Remove debugfs */
+	/* [1] Clear PTEs + flush TLB if any process still has the mapping
+	 *     Must happen BEFORE freeing physical pages, otherwise a racing
+	 *     access could follow a stale PTE into freed/reused memory.
+	 */
+	if (g_state.mapped_mm && g_state.vaddr_start && g_state.vaddr_end) {
+		if (mmget_not_zero(g_state.mapped_mm)) {
+			ptemap_pte_clear_range(g_state.mapped_mm,
+					       g_state.vaddr_start,
+					       g_state.vaddr_end);
+			mmput(g_state.mapped_mm);
+		}
+		mmdrop(g_state.mapped_mm);
+		g_state.mapped_mm = NULL;
+	}
+
+	/* [2] Remove debugfs */
 	ptemap_debugfs_exit();
 
-	/* [2] Unregister cdev */
+	/* [3] Unregister cdev */
 	ptemap_cdev_exit();
 
-	/* [3] Release mm and task references */
+	/* [4] Release mm and task references */
 	if (g_state.target_mm) {
 		mmput(g_state.target_mm);
 		g_state.target_mm = NULL;
@@ -149,10 +164,10 @@ static void __exit ptemap_exit(void)
 		g_state.target_task = NULL;
 	}
 
-	/* [3.5] Free cache strategy arrays */
+	/* [5] Free cache strategy arrays */
 	ptemap_free_cache_arrays();
 
-	/* [4] Free physical pages */
+	/* [6] Free physical pages */
 	ptemap_free_pages();
 
 	pr_info("ptemap: unloaded OK\n");

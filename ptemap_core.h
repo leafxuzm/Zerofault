@@ -34,6 +34,9 @@ struct ptemap_state {
 	struct task_struct *target_task;
 	struct mm_struct *target_mm;
 
+	/* mm that did the mmap (may differ from target_mm) */
+	struct mm_struct *mapped_mm;
+
 	/* Physical pages */
 	struct page **pages;
 	unsigned long nr_pages;
@@ -75,6 +78,8 @@ void ptemap_free_single_page_range(int start, int nr);
 /* ptemap_pte.c — PTE 直写（apply_to_page_range + set_pte_at + pfn_pte） */
 int ptemap_mmap_direct(struct vm_area_struct *vma);
 void ptemap_flush_tlb_range(unsigned long start, unsigned long end);
+void ptemap_pte_clear_range(struct mm_struct *mm, unsigned long start,
+			    unsigned long end);
 
 /* ptemap_cdev.c */
 int ptemap_cdev_init(void);

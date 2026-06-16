@@ -89,6 +89,12 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	g_state.vaddr_end = vma->vm_end;
 	g_state.vaddr_size = size;
 
+	/* Track the mm for safe PTE cleanup at module unload */
+	if (!g_state.mapped_mm) {
+		mmgrab(vma->vm_mm);
+		g_state.mapped_mm = vma->vm_mm;
+	}
+
 	return 0;
 }
 

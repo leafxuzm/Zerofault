@@ -4,8 +4,8 @@
 
 [![Linux](https://img.shields.io/badge/Linux-6.16.2-blue)](https://kernel.org)
 [![License](https://img.shields.io/badge/license-GPL--2.0-green)](LICENSE)
-[![LOC](https://img.shields.io/badge/lines-1469-lightgrey)]()
-[![Version](https://img.shields.io/badge/version-v1.3-brightgreen)]()
+[![LOC](https://img.shields.io/badge/lines-1560-lightgrey)]()
+[![Version](https://img.shields.io/badge/version-v1.3.1-brightgreen)]()
 
 ---
 
@@ -116,15 +116,15 @@ sequenceDiagram
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `ptemap_main.c` | 154 | 模块生命周期：init 参数校验 → 找目标进程 → 分配页+缓存数组 → 注册 cdev → 创建 debugfs；exit 逆序清理 |
-| `ptemap_core.c` | 109 | 物理页管理：预分配/释放 (`alloc_page`+`get_page`/`put_page`)，Per-page 缓存策略数组分配/释放 |
-| `ptemap_cdev.c` | 302 | `/dev/ptemap` 字符设备：open（访问控制）、mmap（v1.0 `vm_insert_page` / v1.1 `apply_to_page_range`）、ioctl（v1.3 QUERY/FLUSH_TLB） |
-| `ptemap_pte.c` | 152 | v1.1 PTE 直写 + v1.2 逐页 cache 策略 + v1.3 TLB flush |
-| `ptemap_debugfs.c` | 266 | 4 个 debugfs 文件：`status`、`mappings`、`stats`、`cache_policy`（rw，逐页设置 WC/WB/UC/WT） |
-| `ptemap_core.h` | 87 | 全局状态结构体 + API 声明 + cache 枚举 + 常量 |
+| `ptemap_main.c` | 177 | 模块生命周期：init 参数校验 → 找目标进程 → 分配页+缓存数组 → 注册 cdev → 创建 debugfs；exit 逆序清理 + PTE 回滚 |
+| `ptemap_core.c` | 112 | 物理页管理：预分配/释放 (`alloc_page`+`get_page`/`free_reserved_page`)，Per-page 缓存策略数组分配/释放 |
+| `ptemap_cdev.c` | 299 | `/dev/ptemap` 字符设备：open（访问控制）、mmap（v1.0 `vm_insert_page` / v1.1 `apply_to_page_range`）、ioctl（v1.3 QUERY/QUERY_RANGE/FLUSH_TLB） |
+| `ptemap_pte.c` | 232 | v1.1 PTE 直写 + v1.2 逐页 cache 策略 + v1.3 TLB flush + v1.3.1 PTE 清除/回滚 |
+| `ptemap_debugfs.c` | 265 | 4 个 debugfs 文件：`status`、`mappings`、`stats`、`cache_policy`（rw，逐页设置 WC/WB/UC/WT） |
+| `ptemap_core.h` | 92 | 全局状态结构体 + API 声明 + cache 枚举 + 常量 |
 | `ptemap.h` | 88 | UAPI 头文件：ioctl 命令号 + 数据结构，用户态 `#include "ptemap.h"` |
-| `test_ptemap.c` | 298 | 用户态测试：open → mmap → 写/读验证 → 跨页边界 → ioctl QUERY → ioctl QUERY_RANGE → ioctl FLUSH_TLB |
-| **合计** | **1456** | |
+| `test_ptemap.c` | 295 | 用户态测试：open → mmap → 写/读验证 → 跨页边界 → ioctl QUERY → ioctl QUERY_RANGE → ioctl FLUSH_TLB |
+| **合计** | **1560** | |
 
 ## 模块参数
 
@@ -214,6 +214,40 @@ perf stat -e page-faults ./test_ptemap 256
 rmmod ptemap
 ```
 
+## 设备模型：物理内存伪装成字符设备
+
+ptemap 利用 Linux 设备模型将一段预分配的物理内存**包装成一个伪字符设备**，用户态通过标准文件操作访问。
+
+### cdev 注册 → /dev/ptemap 自动创建
+
+```
+cdev_init(&cdev, &ptemap_fops)         ① 绑定 file_operations 到 cdev 结构体
+cdev_add(&cdev, dev_num, 1)            ② 向 VFS 注册：设备号 → cdev 的映射
+class_create("ptemap")                 ③ 在 /sys/class/ptemap/ 创建设备类目录
+device_create(class, ..., dev_num, "ptemap")
+                                       ④ 写入设备属性 → 触发 uevent (KOBJ_ADD)
+                                           │
+                                           ▼
+udevd 收到 KOBJ_ADD → 解析设备号 → mknod /dev/ptemap
+```
+
+`device_create()` 是连接内核态和用户态的桥梁：内核在 `/sys/class/ptemap/` 下写入设备号等信息，然后通过 netlink socket 广播 `KOBJ_ADD` 事件。用户态的 `udevd` 守护进程收到后，自动执行 `mknod` 在 `/dev/` 下创建设备节点。这样驱动模块做到了"插拔即用"，无需手动 `mknod`。
+
+### 文件操作 → 内核回调的路由
+
+当用户态程序操作 `/dev/ptemap` 时，内核根据设备号查找已注册的 `file_operations`，将系统调用路由到模块的回调函数：
+
+| 用户态调用 | 内核路由 | 模块回调 | 实际效果 |
+|-----------|---------|---------|---------|
+| `open("/dev/ptemap", O_RDWR)` | VFS → 设备号查找 → cdev | `ptemap_open()` | PID 访问控制 |
+| `mmap(..., fd, 0)` | VFS → 设备号查找 → cdev | `ptemap_mmap()` → `ptemap_mmap_direct()` | `apply_to_page_range` + `set_pte_at` 直写 PTE |
+| `ioctl(fd, PTEMAP_IOC_QUERY, &req)` | VFS → 设备号查找 → cdev | `ptemap_ioctl()` → `ptemap_ioctl_query()` | 查询 PFN/VA/cache |
+| `close(fd)` | VFS → 设备号查找 → cdev | `ptemap_release()` | 清理私有数据 |
+
+### 本质
+
+ptemap 没有真实的硬件。它把内核预分配的物理页（带独立 cache 策略），通过 cdev 框架暴露为一个"内存设备"。用户态的 `ptr = mmap(fd)` 返回的虚拟地址，由模块在 mmap 回调中直接写入 PTE，指向 `alloc_page()` 预分配的物理页。此后用户态对 `ptr` 的 load/store 直接命中物理页，全程不经过内核。（详见 [ptemap 设备模型分析报告](../../../report/ptemap-device-model-cdev-sysfs-udev-2026-06-16.html)）
+
 ## 关键设计决策
 
 ```mermaid
@@ -250,10 +284,11 @@ flowchart LR
 | v1.2 | 完成 | 逐页 cache 策略 (WC/WB/UC/WT)、debugfs `cache_policy` 读写接口 |
 | v1.2.1 | 完成 | RSS 计数器修复 (`_PAGE_SPECIAL` bit 9) |
 | v1.3 | 完成 | ioctl 查询接口 (`QUERY`/`QUERY_RANGE`)、运行时 TLB flush (`FLUSH_TLB`/`FLUSH_TLB_RANGE`) |
+| v1.3.1 | 完成 | 修复 `free_reserved_page()` 释放路径（替代手动 `ClearPageReserved+put_page`）、模块卸载 PTE 回滚 + TLB flush 安全机制 |
 
 ## TODO (v1.4+)
 
-- [ ] **模块卸载安全** — `ptemap_exit()` 回滚 PTE + flush TLB，防止悬挂页表项
+- [x] **模块卸载安全** — `ptemap_exit()` 回滚 PTE + flush TLB，防止悬挂页表项（v1.3.1）
 - [ ] **Huge page 支持** — 2MB/1GB 大页减少 TLB miss
 - [ ] **NUMA 感知** — `alloc_page_node()` 按 NUMA node 分配物理页
 - [ ] **insmod 全局 cache_mode 参数** — 设置默认 cache 策略，不必每次通过 debugfs

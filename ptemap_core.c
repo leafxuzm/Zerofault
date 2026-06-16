@@ -50,8 +50,7 @@ void ptemap_free_single_page_range(int start, int nr)
 
 	for (i = start; i < start + nr && i < g_state.phys_pages; i++) {
 		if (g_state.pages[i]) {
-			ClearPageReserved(g_state.pages[i]);
-			put_page(g_state.pages[i]);
+			free_reserved_page(g_state.pages[i]);
 			g_state.pages[i] = NULL;
 		}
 	}
