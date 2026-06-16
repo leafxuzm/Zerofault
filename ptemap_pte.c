@@ -136,3 +136,20 @@ int ptemap_mmap_direct(struct vm_area_struct *vma)
 
 	return 0;
 }
+
+/*
+ * Flush TLB for a virtual address range on the local CPU.
+ *
+ * On x86, only __flush_tlb_all() is exported to modules (EXPORT_SYMBOL_GPL).
+ * flush_tlb_mm_range() is not callable from out-of-tree code.  Therefore
+ * we always perform a full local TLB flush, ignoring the range parameters.
+ * The range fields are accepted for forward compatibility when the kernel
+ * exports fine-grained flush primitives.
+ *
+ * For HFT scenarios with CPU-pinned processes this covers the hot path.
+ */
+void ptemap_flush_tlb_range(unsigned long start, unsigned long end)
+{
+	__flush_tlb_all();
+	g_state.tlb_flush_count++;
+}

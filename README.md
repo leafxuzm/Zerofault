@@ -4,8 +4,8 @@
 
 [![Linux](https://img.shields.io/badge/Linux-6.16.2-blue)](https://kernel.org)
 [![License](https://img.shields.io/badge/license-GPL--2.0-green)](LICENSE)
-[![LOC](https://img.shields.io/badge/lines-813-lightgrey)]()
-[![Version](https://img.shields.io/badge/version-v1.1-brightgreen)]()
+[![LOC](https://img.shields.io/badge/lines-1469-lightgrey)]()
+[![Version](https://img.shields.io/badge/version-v1.3-brightgreen)]()
 
 ---
 
@@ -40,6 +40,7 @@ flowchart TB
         STATUS["/sys/kernel/debug/ptemap/status"]
         MAPS["/sys/kernel/debug/ptemap/mappings"]
         STATS["/sys/kernel/debug/ptemap/stats"]
+        CACHE["/sys/kernel/debug/ptemap/cache_policy"]
     end
 
     subgraph HW["物理内存"]
@@ -115,14 +116,15 @@ sequenceDiagram
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `ptemap_main.c` | 150 | 模块生命周期：init 参数校验 → 找目标进程 → 分配页 → 注册 cdev → 创建 debugfs；exit 逆序清理 |
-| `ptemap_core.c` | 66 | 物理页管理：`kcalloc` 分配 page 指针数组 → `alloc_page(GFP_KERNEL)` + `get_page()` pin 页 → `put_page()` + `kfree` 释放 |
-| `ptemap_cdev.c` | 157 | `/dev/ptemap` 字符设备：open（访问控制）、mmap（v1.0 `vm_insert_page` / v1.1 `apply_to_page_range`）、ioctl（v1.2 预留） |
-| `ptemap_pte.c` | 113 | v1.1 PTE 直写：`apply_to_page_range` 遍历页表 → 逐页 `pfn_pte` + `set_pte_at` 直接构造并写入 PTE |
-| `ptemap_debugfs.c` | 135 | 3 个 debugfs 文件：`status`（模块状态）、`mappings`（每页 VA/PFN 表）、`stats`（内存统计） |
-| `ptemap_core.h` | 65 | 全局状态结构体 + API 声明 + 常量定义 |
-| `test_ptemap.c` | 127 | 用户态测试：open → mmap → 写 pattern → 读验证 → 跨页边界测试 |
-| **合计** | **813** | |
+| `ptemap_main.c` | 154 | 模块生命周期：init 参数校验 → 找目标进程 → 分配页+缓存数组 → 注册 cdev → 创建 debugfs；exit 逆序清理 |
+| `ptemap_core.c` | 109 | 物理页管理：预分配/释放 (`alloc_page`+`get_page`/`put_page`)，Per-page 缓存策略数组分配/释放 |
+| `ptemap_cdev.c` | 302 | `/dev/ptemap` 字符设备：open（访问控制）、mmap（v1.0 `vm_insert_page` / v1.1 `apply_to_page_range`）、ioctl（v1.3 QUERY/FLUSH_TLB） |
+| `ptemap_pte.c` | 152 | v1.1 PTE 直写 + v1.2 逐页 cache 策略 + v1.3 TLB flush |
+| `ptemap_debugfs.c` | 266 | 4 个 debugfs 文件：`status`、`mappings`、`stats`、`cache_policy`（rw，逐页设置 WC/WB/UC/WT） |
+| `ptemap_core.h` | 87 | 全局状态结构体 + API 声明 + cache 枚举 + 常量 |
+| `ptemap.h` | 88 | UAPI 头文件：ioctl 命令号 + 数据结构，用户态 `#include "ptemap.h"` |
+| `test_ptemap.c` | 298 | 用户态测试：open → mmap → 写/读验证 → 跨页边界 → ioctl QUERY → ioctl QUERY_RANGE → ioctl FLUSH_TLB |
+| **合计** | **1456** | |
 
 ## 模块参数
 
@@ -155,12 +157,21 @@ insmod ptemap.ko phys_pages=256
 # ===== 调试查看 =====
 cat /sys/kernel/debug/ptemap/status
 #  state:     LIVE
-#  version:   1.0.0
+#  version:   1.3.0
 #  pages:     256 (total)
 #  size:      1048576 bytes (1 MB)
 #  target_pid: 0
+#  direct_pte: 1 (PTE direct write)
 #  vaddr:     0x7f...-0x7f...
 #  tlb_flush: 0
+
+cat /sys/kernel/debug/ptemap/cache_policy
+#  pages count  mode
+#  ----- ------ ------
+#  all   256    WC
+
+echo "0-63 WB" > /sys/kernel/debug/ptemap/cache_policy
+#  → 前 64 页切换为 Write-Back
 
 cat /sys/kernel/debug/ptemap/mappings
 #  idx   vaddr              pfn                 size
@@ -183,6 +194,16 @@ insmod ptemap.ko phys_pages=256 use_direct_pte=1
 #  [4] verify OK (0 errors)
 #  [5] cross-page boundary test...
 #  [5] boundary OK
+#  --- ioctl QUERY test ---
+#    page[  0] pfn=0x5002 vaddr=0x7fc14036c000 cache=0
+#    page[  1] pfn=0x4ffb vaddr=0x7fc14036d000 cache=0
+#    ...
+#  QUERY OK (0 errors)
+#  --- ioctl QUERY_RANGE test ---
+#  QUERY_RANGE OK (64 pages, 0 errors)
+#  --- ioctl FLUSH_TLB test ---
+#  FLUSH_TLB OK
+#  FLUSH_TLB_RANGE OK (range 0x0-0x1000)
 #  === result: PASS ===
 
 # ===== 验证零缺页 =====
@@ -216,25 +237,28 @@ flowchart LR
 | 物理页分配时机 | **insmod 时** | 避免 mmap 后首次访问的缺页延迟抖动 |
 | 页映射方式(v1.0) | **vm_insert_page** | 内核标准 API，不用手动走 page table walk |
 | 页映射方式(v1.1) | **apply_to_page_range + set_pte_at** | 直写 PTE，零 rmap 开销，逐页独立 pgprot_t 控制 |
-| Cache 策略 | **writecombine** | UC 太慢，WB 有 cache 一致性开销，WC 折中 |
+| Cache 策略 | **WC 默认，逐页可配** | WC 折中延迟与吞吐，debugfs/ioctl 可查询和设置 WB/UC/WT |
+| Cache 属性生效时机 | **mmap 时一锤定音** | 运行时热切需 TLB shootdown + cache flush，HFT 场景不可接受 |
 | 调试接口 | **debugfs** | 无 API 兼容性承诺，适合开发期快速迭代 |
 
 ## 版本状态
 
 | 版本 | 状态 | 内容 |
 |------|------|------|
-| v1.0 | 完成 | 模块生命周期、物理页预分配/pin、cdev + mmap (`vm_insert_page`)、debugfs、用户态测试 |
-| v1.1 | 完成 | PTE 直写 (`apply_to_page_range` + `set_pte_at` + `pfn_pte`)、双路径可切换 (`use_direct_pte`)、`remap_pfn_range` 已移除 |
+| v1.0 | 完成 | 模块生命周期、物理页预分配/pin、cdev + mmap (`vm_insert_page`)、debugfs |
+| v1.1 | 完成 | PTE 直写 (`apply_to_page_range` + `set_pte_at` + `pfn_pte`)、双路径可切换 (`use_direct_pte`) |
+| v1.2 | 完成 | 逐页 cache 策略 (WC/WB/UC/WT)、debugfs `cache_policy` 读写接口 |
+| v1.2.1 | 完成 | RSS 计数器修复 (`_PAGE_SPECIAL` bit 9) |
+| v1.3 | 完成 | ioctl 查询接口 (`QUERY`/`QUERY_RANGE`)、运行时 TLB flush (`FLUSH_TLB`/`FLUSH_TLB_RANGE`) |
 
-## TODO (v1.2+)
+## TODO (v1.4+)
 
-- [x] **PTE 直写** — `apply_to_page_range` + `pfn_pte` + `set_pte_at` 直接构造 PTE（v1.1 已完成并测试通过）
-- [x] **双路径保留** — v1.0 `vm_insert_page` 与 v1.1 直写均可通过 `use_direct_pte` 参数切换
-- [ ] **ioctl 查询接口** — 查询映射信息（每页 PFN/VA/cache 策略）、运行时 TLB flush 控制
-- [ ] **NUMA 感知** — `alloc_page_node()` 按 NUMA node 分配物理页
+- [ ] **模块卸载安全** — `ptemap_exit()` 回滚 PTE + flush TLB，防止悬挂页表项
 - [ ] **Huge page 支持** — 2MB/1GB 大页减少 TLB miss
-- [ ] **逐页 cache 策略** — 利用 `apply_to_page_range` 回调的逐页 pgprot 参数，不同页可用不同 PAT（WC/WB/UC）
-- [ ] **性能基准报告** — mmap 延迟对比（v1.0 vs v1.1）、读写吞吐、TLB miss rate
+- [ ] **NUMA 感知** — `alloc_page_node()` 按 NUMA node 分配物理页
+- [ ] **insmod 全局 cache_mode 参数** — 设置默认 cache 策略，不必每次通过 debugfs
+- [ ] **多进程共享** — `ptemap_share()` 跨进程 mm 共享
+- [ ] **性能基准报告** — mmap 延迟对比、读写吞吐、TLB miss rate
 
 ## License
 

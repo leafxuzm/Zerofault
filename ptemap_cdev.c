@@ -8,7 +8,9 @@
 #include <linux/device.h>
 #include <linux/uaccess.h>
 #include <linux/capability.h>
+#include <linux/mm_types.h>
 #include "ptemap_core.h"
+#include "ptemap.h"
 
 #define PTEMAP_DEV_NAME "ptemap"
 
@@ -90,10 +92,143 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	return 0;
 }
 
+/*
+ * PTEMAP_IOC_QUERY — query a single page by index.
+ */
+static int ptemap_ioctl_query(unsigned long arg)
+{
+	struct ptemap_query_req req;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+
+	if (req.page_idx >= g_state.nr_pages)
+		return -EINVAL;
+
+	/* PFN */
+	if (g_state.pages && g_state.pages[req.page_idx])
+		req.pfn = page_to_pfn(g_state.pages[req.page_idx]);
+	else
+		req.pfn = 0;
+
+	/* VA */
+	if (g_state.vaddr_start)
+		req.vaddr = g_state.vaddr_start + ((unsigned long)req.page_idx << PAGE_SHIFT);
+	else
+		req.vaddr = 0;
+
+	/* Cache mode */
+	if (g_state.page_cache)
+		req.cache_mode = g_state.page_cache[req.page_idx];
+	else
+		req.cache_mode = PTEMAP_CACHE_WC;
+
+	if (copy_to_user((void __user *)arg, &req, sizeof(req)))
+		return -EFAULT;
+
+	return 0;
+}
+
+/*
+ * PTEMAP_IOC_QUERY_RANGE — batch query a page range.
+ */
+static int ptemap_ioctl_query_range(unsigned long arg)
+{
+	struct ptemap_query_range_req req;
+	unsigned long i, end;
+	__u32 *cache_kern = NULL;
+	__u64 *pfn_kern = NULL;
+	__u64 *va_kern = NULL;
+	int ret = 0;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+
+	if (req.start_idx >= g_state.nr_pages ||
+	    req.nr_pages == 0 ||
+	    req.nr_pages > g_state.nr_pages - req.start_idx)
+		return -EINVAL;
+
+	end = req.start_idx + req.nr_pages;
+
+	/* Validate user pointers */
+	if (!req.pfn_buf || !req.vaddr_buf || !req.cache_buf)
+		return -EINVAL;
+
+	/* Allocate kernel-side temp buffers */
+	cache_kern = kmalloc_array(req.nr_pages, sizeof(__u32), GFP_KERNEL);
+	pfn_kern   = kmalloc_array(req.nr_pages, sizeof(__u64), GFP_KERNEL);
+	va_kern    = kmalloc_array(req.nr_pages, sizeof(__u64), GFP_KERNEL);
+	if (!cache_kern || !pfn_kern || !va_kern) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	for (i = req.start_idx; i < end; i++) {
+		unsigned long idx = i - req.start_idx;
+
+		pfn_kern[idx] = (g_state.pages && g_state.pages[i])
+			? page_to_pfn(g_state.pages[i]) : 0;
+
+		va_kern[idx] = g_state.vaddr_start
+			? g_state.vaddr_start + (i << PAGE_SHIFT) : 0;
+
+		cache_kern[idx] = g_state.page_cache
+			? g_state.page_cache[i] : PTEMAP_CACHE_WC;
+	}
+
+	if (copy_to_user(req.pfn_buf,   pfn_kern,   req.nr_pages * sizeof(__u64)))
+		{ ret = -EFAULT; goto out; }
+	if (copy_to_user(req.vaddr_buf,  va_kern,    req.nr_pages * sizeof(__u64)))
+		{ ret = -EFAULT; goto out; }
+	if (copy_to_user(req.cache_buf,  cache_kern, req.nr_pages * sizeof(__u32)))
+		{ ret = -EFAULT; goto out; }
+
+out:
+	kfree(cache_kern);
+	kfree(pfn_kern);
+	kfree(va_kern);
+	return ret;
+}
+
+/*
+ * PTEMAP_IOC_FLUSH_TLB — full local TLB flush.
+ */
+static int ptemap_ioctl_flush_tlb(void)
+{
+	ptemap_flush_tlb_range(0, TLB_FLUSH_ALL);
+	return 0;
+}
+
+/*
+ * PTEMAP_IOC_FLUSH_TLB_RANGE — range-directed TLB flush.
+ * On current x86 the flush is always full-TLB (see ptemap_pte.c).
+ */
+static int ptemap_ioctl_flush_tlb_range(unsigned long arg)
+{
+	struct ptemap_flush_req req;
+
+	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+		return -EFAULT;
+
+	ptemap_flush_tlb_range(req.start, req.start + req.len);
+	return 0;
+}
+
 static long ptemap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
-	/* Reserved for v1.1: query mapping info, stats */
-	return -ENOTTY;
+	switch (cmd) {
+	case PTEMAP_IOC_QUERY:
+		return ptemap_ioctl_query(arg);
+	case PTEMAP_IOC_QUERY_RANGE:
+		return ptemap_ioctl_query_range(arg);
+	case PTEMAP_IOC_FLUSH_TLB:
+		return ptemap_ioctl_flush_tlb();
+	case PTEMAP_IOC_FLUSH_TLB_RANGE:
+		return ptemap_ioctl_flush_tlb_range(arg);
+	default:
+		return -ENOTTY;
+	}
 }
 
 static const struct file_operations ptemap_fops = {
@@ -102,6 +237,7 @@ static const struct file_operations ptemap_fops = {
 	.release        = ptemap_release,
 	.mmap           = ptemap_mmap,
 	.unlocked_ioctl = ptemap_ioctl,
+	.compat_ioctl   = compat_ptr_ioctl,
 };
 
 int ptemap_cdev_init(void)
