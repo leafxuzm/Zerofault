@@ -6,6 +6,8 @@
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/debugfs.h>
+#include <linux/list.h>
+#include <linux/spinlock.h>
 
 #define PTEMAP_MAX_PAGES 4096
 
@@ -24,6 +26,18 @@ enum ptemap_cache_mode {
  */
 pgprot_t ptemap_cache_pgprot(enum ptemap_cache_mode mode, pgprot_t base);
 
+/*
+ * Per-process mapped region — one node per process that mmap'd.
+ * Linked into g_state.mapped_regions for module-unload cleanup.
+ */
+struct ptemap_mapped_region {
+	struct list_head node;
+	struct mm_struct *mm;
+	unsigned long vaddr_start;
+	unsigned long vaddr_end;
+	bool cleaned;  /* true if exit already processed this region */
+};
+
 /* Global module state */
 struct ptemap_state {
 	/* Module parameters */
@@ -34,8 +48,10 @@ struct ptemap_state {
 	struct task_struct *target_task;
 	struct mm_struct *target_mm;
 
-	/* mm that did the mmap (may differ from target_mm) */
-	struct mm_struct *mapped_mm;
+	/* Track all processes that mmap'd — linked list of ptemap_mapped_region.
+	 * Protected by mapped_lock.  Each node holds an mmgrab ref on the mm. */
+	struct list_head mapped_regions;
+	spinlock_t mapped_lock;
 
 	/* Physical pages */
 	struct page **pages;

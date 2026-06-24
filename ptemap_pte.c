@@ -127,16 +127,6 @@ int ptemap_mmap_direct(struct vm_area_struct *vma)
 		return ret;
 	}
 
-	g_state.vaddr_start = vma->vm_start;
-	g_state.vaddr_end   = vma->vm_end;
-	g_state.vaddr_size  = vma->vm_end - vma->vm_start;
-
-	/* Track the mm for safe PTE cleanup at module unload */
-	if (!g_state.mapped_mm) {
-		mmgrab(vma->vm_mm);
-		g_state.mapped_mm = vma->vm_mm;
-	}
-
 	pr_info("ptemap: mmap DIRECT OK: vaddr=0x%lx-0x%lx pages=%lu pid=%d\n",
 		vma->vm_start, vma->vm_end, nr_pages, current->pid);
 
@@ -242,15 +232,6 @@ int ptemap_mmap_huge(struct vm_area_struct *vma)
 				mm_dec_nr_ptes(vma->vm_mm);
 			}
 		}
-	}
-
-	g_state.vaddr_start = vma->vm_start;
-	g_state.vaddr_end   = vma->vm_end;
-	g_state.vaddr_size  = vma->vm_end - vma->vm_start;
-
-	if (!g_state.mapped_mm) {
-		mmgrab(vma->vm_mm);
-		g_state.mapped_mm = vma->vm_mm;
 	}
 
 	pr_info("ptemap: mmap HUGE OK: vaddr=0x%lx-0x%lx huge_pages=%lu pid=%d\n",

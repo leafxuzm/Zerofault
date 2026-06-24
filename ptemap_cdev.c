@@ -14,8 +14,19 @@
 
 #define PTEMAP_DEV_NAME "ptemap"
 
+/*
+ * Per-open file private data — each process that opens /dev/ptemap
+ * gets its own instance.  This allows multiple processes to mmap the
+ * same physical pages at different virtual addresses.
+ */
+struct ptemap_file_data {
+	struct ptemap_mapped_region *region;  /* non-NULL once mmap is called */
+};
+
 static int ptemap_open(struct inode *inode, struct file *filp)
 {
+	struct ptemap_file_data *fd;
+
 	/* Access control: only target_pid process (or any if target_pid=0) */
 	if (g_state.target_pid > 0 && current->pid != g_state.target_pid) {
 		pr_warn("ptemap: PID %d (%s) denied access (target_pid=%d)\n",
@@ -23,13 +34,33 @@ static int ptemap_open(struct inode *inode, struct file *filp)
 		return -EPERM;
 	}
 
-	/* Use module state as file private data */
-	filp->private_data = &g_state;
+	fd = kzalloc(sizeof(*fd), GFP_KERNEL);
+	if (!fd)
+		return -ENOMEM;
+
+	filp->private_data = fd;
 	return 0;
 }
 
 static int ptemap_release(struct inode *inode, struct file *filp)
 {
+	struct ptemap_file_data *fd = filp->private_data;
+
+	if (fd) {
+		if (fd->region) {
+			spin_lock(&g_state.mapped_lock);
+			if (!fd->region->cleaned) {
+				list_del(&fd->region->node);
+				spin_unlock(&g_state.mapped_lock);
+				mmdrop(fd->region->mm);
+				kfree(fd->region);
+			} else {
+				spin_unlock(&g_state.mapped_lock);
+			}
+			fd->region = NULL;
+		}
+		kfree(fd);
+	}
 	filp->private_data = NULL;
 	return 0;
 }
@@ -39,11 +70,53 @@ static int ptemap_release(struct inode *inode, struct file *filp)
  * process's virtual address space. All pages were allocated at module
  * init time - no allocation happens here, so no page faults at runtime.
  */
+/*
+ * Register this mmap in the per-process tracking list.  Called after
+ * the PTE/PMD work succeeds so we never track a failed mapping.
+ */
+static void ptemap_track_mapping(struct file *filp, struct vm_area_struct *vma)
+{
+	struct ptemap_file_data *fd = filp->private_data;
+	struct ptemap_mapped_region *r;
+
+	/* If this fd was already mapped, remove the old region first */
+	if (fd && fd->region) {
+		spin_lock(&g_state.mapped_lock);
+		list_del(&fd->region->node);
+		spin_unlock(&g_state.mapped_lock);
+		mmdrop(fd->region->mm);
+		kfree(fd->region);
+		fd->region = NULL;
+	}
+
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return;
+
+	mmgrab(vma->vm_mm);
+	r->mm = vma->vm_mm;
+	r->vaddr_start = vma->vm_start;
+	r->vaddr_end = vma->vm_end;
+
+	spin_lock(&g_state.mapped_lock);
+	list_add(&r->node, &g_state.mapped_regions);
+	spin_unlock(&g_state.mapped_lock);
+
+	if (fd)
+		fd->region = r;
+
+	/* Update global VA for debugfs display (last mapper wins) */
+	g_state.vaddr_start = vma->vm_start;
+	g_state.vaddr_end = vma->vm_end;
+	g_state.vaddr_size = vma->vm_end - vma->vm_start;
+}
+
 static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	unsigned long i;
 	unsigned long size = vma->vm_end - vma->vm_start;
 	unsigned long nr_requested = size / g_state.page_size;
+	int ret;
 
 	if (!g_state.pages || g_state.nr_pages == 0) {
 		pr_err("ptemap: no pages available for mmap\n");
@@ -57,13 +130,21 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	}
 
 	/* v1.4: 2MB huge page path — manual PGD→P4D→PUD→PMD walk */
-	if (g_state.huge_page == 2)
-		return ptemap_mmap_huge(vma);
+	if (g_state.huge_page == 2) {
+		ret = ptemap_mmap_huge(vma);
+		if (ret == 0)
+			ptemap_track_mapping(filp, vma);
+		return ret;
+	}
 
 	/* v1.1: PTE 直写路径 — apply_to_page_range + set_pte_at，完全绕过
 	 * vm_insert_page / remap_pfn_range，零 rmap 开销，逐页可独立 pgprot */
-	if (g_state.use_direct_pte)
-		return ptemap_mmap_direct(vma);
+	if (g_state.use_direct_pte) {
+		ret = ptemap_mmap_direct(vma);
+		if (ret == 0)
+			ptemap_track_mapping(filp, vma);
+		return ret;
+	}
 
 	/* v1.0: vm_insert_page 路径（默认） */
 	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
@@ -71,7 +152,6 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 
 	for (i = 0; i < nr_requested; i++) {
 		unsigned long vaddr = vma->vm_start + (i << PAGE_SHIFT);
-		int ret;
 
 		ret = vm_insert_page(vma, vaddr, g_state.pages[i]);
 		if (ret) {
@@ -81,28 +161,19 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 		}
 	}
 
+	ptemap_track_mapping(filp, vma);
 	pr_info("ptemap: mmap OK: vaddr=0x%lx-0x%lx pages=%lu pid=%d\n",
 		vma->vm_start, vma->vm_end, nr_requested, current->pid);
-
-	g_state.vaddr_start = vma->vm_start;
-	g_state.vaddr_end = vma->vm_end;
-	g_state.vaddr_size = size;
-
-	/* Track the mm for safe PTE cleanup at module unload */
-	if (!g_state.mapped_mm) {
-		mmgrab(vma->vm_mm);
-		g_state.mapped_mm = vma->vm_mm;
-	}
-
 	return 0;
 }
 
 /*
  * PTEMAP_IOC_QUERY — query a single page by index.
  */
-static int ptemap_ioctl_query(unsigned long arg)
+static int ptemap_ioctl_query(struct ptemap_file_data *fd, unsigned long arg)
 {
 	struct ptemap_query_req req;
+	unsigned long vaddr_base;
 
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
@@ -116,9 +187,10 @@ static int ptemap_ioctl_query(unsigned long arg)
 	else
 		req.pfn = 0;
 
-	/* VA */
-	if (g_state.vaddr_start)
-		req.vaddr = g_state.vaddr_start + (unsigned long)req.page_idx * g_state.page_size;
+	/* VA — per-process if available, otherwise last known global */
+	vaddr_base = (fd && fd->region) ? fd->region->vaddr_start : g_state.vaddr_start;
+	if (vaddr_base)
+		req.vaddr = vaddr_base + (unsigned long)req.page_idx * g_state.page_size;
 	else
 		req.vaddr = 0;
 
@@ -140,10 +212,10 @@ static int ptemap_ioctl_query(unsigned long arg)
 /*
  * PTEMAP_IOC_QUERY_RANGE — batch query a page range.
  */
-static int ptemap_ioctl_query_range(unsigned long arg)
+static int ptemap_ioctl_query_range(struct ptemap_file_data *fd, unsigned long arg)
 {
 	struct ptemap_query_range_req req;
-	unsigned long i, end;
+	unsigned long i, end, vaddr_base;
 	__u32 *cache_kern = NULL;
 	__u64 *pfn_kern = NULL;
 	__u64 *va_kern = NULL;
@@ -163,6 +235,9 @@ static int ptemap_ioctl_query_range(unsigned long arg)
 	if (!req.pfn_buf || !req.vaddr_buf || !req.cache_buf)
 		return -EINVAL;
 
+	/* VA base — per-process if available, otherwise last known global */
+	vaddr_base = (fd && fd->region) ? fd->region->vaddr_start : g_state.vaddr_start;
+
 	/* Allocate kernel-side temp buffers */
 	cache_kern = kmalloc_array(req.nr_pages, sizeof(__u32), GFP_KERNEL);
 	pfn_kern   = kmalloc_array(req.nr_pages, sizeof(__u64), GFP_KERNEL);
@@ -178,8 +253,8 @@ static int ptemap_ioctl_query_range(unsigned long arg)
 		pfn_kern[idx] = (g_state.pages && g_state.pages[i])
 			? page_to_pfn(g_state.pages[i]) : 0;
 
-		va_kern[idx] = g_state.vaddr_start
-			? g_state.vaddr_start + (i * g_state.page_size) : 0;
+		va_kern[idx] = vaddr_base
+			? vaddr_base + (i * g_state.page_size) : 0;
 
 		cache_kern[idx] = g_state.page_cache
 			? g_state.page_cache[i] : PTEMAP_CACHE_WC;
@@ -225,11 +300,13 @@ static int ptemap_ioctl_flush_tlb_range(unsigned long arg)
 
 static long ptemap_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+	struct ptemap_file_data *fd = filp->private_data;
+
 	switch (cmd) {
 	case PTEMAP_IOC_QUERY:
-		return ptemap_ioctl_query(arg);
+		return ptemap_ioctl_query(fd, arg);
 	case PTEMAP_IOC_QUERY_RANGE:
-		return ptemap_ioctl_query_range(arg);
+		return ptemap_ioctl_query_range(fd, arg);
 	case PTEMAP_IOC_FLUSH_TLB:
 		return ptemap_ioctl_flush_tlb();
 	case PTEMAP_IOC_FLUSH_TLB_RANGE:

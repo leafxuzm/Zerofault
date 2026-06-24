@@ -94,6 +94,10 @@ static int __init ptemap_init(void)
 		return -EINVAL;
 	}
 
+	/* [1.5] Initialize multi-process tracking */
+	INIT_LIST_HEAD(&g_state.mapped_regions);
+	spin_lock_init(&g_state.mapped_lock);
+
 	/* [2] If target_pid specified, verify process exists */
 	if (target_pid > 0) {
 		struct task_struct *task;
@@ -180,25 +184,43 @@ static void __exit ptemap_exit(void)
 {
 	pr_info("ptemap: unloading...\n");
 
-	/* [1] Clear PTEs + flush TLB if any process still has the mapping
-	 *     Must happen BEFORE freeing physical pages, otherwise a racing
-	 *     access could follow a stale PTE into freed/reused memory.
-	 */
-	if (g_state.mapped_mm && g_state.vaddr_start && g_state.vaddr_end) {
-		if (mmget_not_zero(g_state.mapped_mm)) {
-			if (g_state.huge_page == 2)
-				ptemap_huge_clear_range(g_state.mapped_mm,
-							g_state.vaddr_start,
-							g_state.vaddr_end);
-			else
-				ptemap_pte_clear_range(g_state.mapped_mm,
-						       g_state.vaddr_start,
-						       g_state.vaddr_end);
-			mmput(g_state.mapped_mm);
+	/* [1] Clear PTEs + flush TLB for every process that mmap'd.
+		 *     Must happen BEFORE freeing physical pages, otherwise a racing
+		 *     access could follow a stale PTE into freed/reused memory.
+		 *
+		 *     Strategy: move all nodes to a local list under mapped_lock,
+		 *     mark each cleaned so ptemap_release() skips them, then process
+		 *     the local list without the lock.  We do the mmdrop+kfree here
+		 *     because after exit the region must be fully disposed — release
+		 *     won't touch a cleaned region.
+		 */
+		{
+			LIST_HEAD(cleanup_list);
+			struct ptemap_mapped_region *r, *tmp;
+
+			spin_lock(&g_state.mapped_lock);
+			list_for_each_entry_safe(r, tmp, &g_state.mapped_regions, node) {
+				r->cleaned = true;
+				list_move(&r->node, &cleanup_list);
+			}
+			spin_unlock(&g_state.mapped_lock);
+
+			list_for_each_entry_safe(r, tmp, &cleanup_list, node) {
+				if (mmget_not_zero(r->mm)) {
+					if (g_state.huge_page == 2)
+						ptemap_huge_clear_range(r->mm,
+									r->vaddr_start,
+									r->vaddr_end);
+					else
+						ptemap_pte_clear_range(r->mm,
+								       r->vaddr_start,
+								       r->vaddr_end);
+					mmput(r->mm);
+				}
+				mmdrop(r->mm);
+				kfree(r);
+			}
 		}
-		mmdrop(g_state.mapped_mm);
-		g_state.mapped_mm = NULL;
-	}
 
 	/* [2] Remove debugfs */
 	ptemap_debugfs_exit();
