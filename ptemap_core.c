@@ -25,10 +25,10 @@ int ptemap_alloc_pages(void)
 
 	for (i = 0; i < g_state.phys_pages; i++) {
 		if (g_state.huge_page == 2)
-			page = alloc_pages(GFP_KERNEL | __GFP_COMP,
+			page = alloc_pages_node(g_state.numa_node, GFP_KERNEL | __GFP_COMP,
 					   g_state.page_order);
 		else
-			page = alloc_page(GFP_KERNEL);
+			page = alloc_pages_node(g_state.numa_node, GFP_KERNEL, 0);
 		if (!page)
 			goto rollback;
 

@@ -63,6 +63,9 @@ struct ptemap_state {
 	unsigned long page_size; /* 4096 or 2MB */
 	int page_order;		/* 0 for 4KB, 9 for 2MB */
 
+	/* NUMA */
+	int numa_node;		/* -1 = any (default), >=0 = specific node */
+
 	/* Default cache mode (set via insmod default_cache=) */
 	enum ptemap_cache_mode default_cache_mode;
 

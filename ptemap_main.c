@@ -33,11 +33,16 @@ static char *default_cache = "WC";
 module_param(default_cache, charp, 0644);
 MODULE_PARM_DESC(default_cache, "Default cache mode for all pages: WC (default), WB, UC, WT");
 
+static int target_numa_node = -1;
+module_param_named(numa_node, target_numa_node, int, 0644);
+MODULE_PARM_DESC(numa_node, "NUMA node for physical page allocation (-1 = any, default)");
+
 /* Global module state */
 struct ptemap_state g_state = {
 	.phys_pages = 256,
 	.target_pid = 0,
 	.default_cache_mode = PTEMAP_CACHE_WC,
+	.numa_node = -1,
 };
 
 static int __init ptemap_init(void)
@@ -80,6 +85,14 @@ static int __init ptemap_init(void)
 		return -EINVAL;
 	}
 	g_state.huge_page = huge_page;
+
+	/* Validate NUMA node */
+	g_state.numa_node = target_numa_node;
+	if (target_numa_node >= 0 && !node_possible(target_numa_node)) {
+		pr_err("ptemap: target_numa_node=%d is not a possible node (nr_node_ids=%d)\n",
+		       target_numa_node, nr_node_ids);
+		return -EINVAL;
+	}
 
 	/* [2] If target_pid specified, verify process exists */
 	if (target_pid > 0) {
