@@ -23,7 +23,11 @@ int ptemap_alloc_pages(void)
 		return -ENOMEM;
 
 	for (i = 0; i < g_state.phys_pages; i++) {
-		page = alloc_page(GFP_KERNEL);
+		if (g_state.huge_page == 2)
+			page = alloc_pages(GFP_KERNEL | __GFP_COMP,
+					   g_state.page_order);
+		else
+			page = alloc_page(GFP_KERNEL);
 		if (!page)
 			goto rollback;
 
@@ -50,7 +54,11 @@ void ptemap_free_single_page_range(int start, int nr)
 
 	for (i = start; i < start + nr && i < g_state.phys_pages; i++) {
 		if (g_state.pages[i]) {
-			free_reserved_page(g_state.pages[i]);
+			if (g_state.huge_page == 2)
+				__free_pages(g_state.pages[i],
+					     g_state.page_order);
+			else
+				free_reserved_page(g_state.pages[i]);
 			g_state.pages[i] = NULL;
 		}
 	}
@@ -109,4 +117,24 @@ void ptemap_free_cache_arrays(void)
 	g_state.page_cache = NULL;
 	kfree(g_state.page_pgprot);
 	g_state.page_pgprot = NULL;
+}
+
+/*
+ * Convert cache mode to PMD-level pgprot_t for 2MB huge pages.
+ * Wraps ptemap_cache_pgprot() and shifts _PAGE_PAT from bit 7
+ * to bit 12 (_PAGE_PAT_LARGE) via pgprot_4k_2_large().
+ *
+ * _PAGE_SPECIAL is cleared: it is a PTE-level software bit that
+ * is not valid in PMD entries and triggers pmd_bad() warnings.
+ */
+pgprot_t ptemap_cache_pgprot_huge(enum ptemap_cache_mode mode, pgprot_t base)
+{
+	pgprot_t prot = ptemap_cache_pgprot(mode, base);
+	pgprotval_t val = pgprot_val(prot);
+
+	/* Clear PTE-only bits before promoting to PMD level */
+	val &= ~_PAGE_SPECIAL;
+	prot = __pgprot(val);
+
+	return pgprot_4k_2_large(prot);
 }

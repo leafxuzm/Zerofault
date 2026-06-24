@@ -44,6 +44,8 @@ enum ptemap_cache_mode_user {
 struct ptemap_query_req {
 	__u32 page_idx;
 	__u32 cache_mode;
+	__u32 page_size;   /* output: actual page size (4096 or 2MB) */
+	__u32 __pad;
 	__u64 pfn;
 	__u64 vaddr;
 };

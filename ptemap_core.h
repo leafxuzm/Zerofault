@@ -58,6 +58,11 @@ struct ptemap_state {
 	/* debugfs */
 	struct dentry *debugfs_dir;
 
+	/* Huge page support */
+	int huge_page;		/* 0 = 4KB (default), 2 = 2MB PMD-level */
+	unsigned long page_size; /* 4096 or 2MB */
+	int page_order;		/* 0 for 4KB, 9 for 2MB */
+
 	/* PTE direct write */
 	int use_direct_pte;
 
@@ -80,6 +85,12 @@ int ptemap_mmap_direct(struct vm_area_struct *vma);
 void ptemap_flush_tlb_range(unsigned long start, unsigned long end);
 void ptemap_pte_clear_range(struct mm_struct *mm, unsigned long start,
 			    unsigned long end);
+
+/* PMD huge page mapping */
+int ptemap_mmap_huge(struct vm_area_struct *vma);
+void ptemap_huge_clear_range(struct mm_struct *mm, unsigned long start,
+			     unsigned long end);
+pgprot_t ptemap_cache_pgprot_huge(enum ptemap_cache_mode mode, pgprot_t base);
 
 /* ptemap_cdev.c */
 int ptemap_cdev_init(void);

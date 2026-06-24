@@ -144,6 +144,122 @@ int ptemap_mmap_direct(struct vm_area_struct *vma)
 }
 
 /*
+ * No-op PTE callback for pre-populating the page table structure.
+ */
+static int ptemap_pte_noop(pte_t *pte, unsigned long addr, void *data)
+{
+	return 0;
+}
+
+/*
+ * mmap callback for 2MB PMD-level huge pages.
+ *
+ * Strategy: use apply_to_page_range() with a no-op callback to allocate
+ * the full page table tree (PGD→P4D→PUD→PMD→PTE) via the kernel's built-in
+ * allocator (handles PTI internally).  Then walk the now-populated table
+ * and replace each PTE-level PMD entry with a PMD-level huge entry.
+ */
+int ptemap_mmap_huge(struct vm_area_struct *vma)
+{
+	unsigned long addr, end, pfn;
+	unsigned long nr_huge, size;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	pmd_t new_pmd;
+	pgprot_t base_prot;
+	int i, ret;
+
+	nr_huge = (vma->vm_end - vma->vm_start) >> PMD_SHIFT;
+	if (nr_huge > g_state.nr_pages) {
+		pr_err("ptemap: mmap requests %lu huge pages, only %lu allocated\n",
+		       nr_huge, g_state.nr_pages);
+		return -EINVAL;
+	}
+
+	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP | VM_PFNMAP);
+
+	/* Recompute page_pgprot[] per huge page */
+	base_prot = vma->vm_page_prot;
+	for (i = 0; i < nr_huge; i++)
+		g_state.page_pgprot[i] = ptemap_cache_pgprot_huge(
+			g_state.page_cache[i], base_prot);
+
+	vma->vm_page_prot = pgprot_large_2_4k(g_state.page_pgprot[0]);
+
+	/*
+	 * Step 1: pre-populate the entire page table tree.  This handles
+	 * PTI mirroring (native_set_p4d etc.) via the kernel's internal
+	 * code path, which is not available to modules directly.
+	 */
+	size = nr_huge << PMD_SHIFT;
+	ret = apply_to_page_range(vma->vm_mm, vma->vm_start, size,
+				  ptemap_pte_noop, NULL);
+	if (ret) {
+		pr_err("ptemap: apply_to_page_range pre-populate failed: %d\n", ret);
+		return ret;
+	}
+
+	/*
+	 * Step 2: walk the now-populated table and upgrade each 2MB
+	 * range from PTE-level to PMD-level huge mapping.
+	 *
+	 * apply_to_page_range() allocated PTE pages (one per 2MB range)
+	 * which become orphaned when we replace the PMD entry.  Free them
+	 * and decrement mm->pgtables_bytes to avoid a BUG at mm teardown.
+	 */
+	end = vma->vm_end;
+	for (addr = vma->vm_start, i = 0; addr < end;
+	     addr += PMD_SIZE, i++) {
+		pgd = pgd_offset(vma->vm_mm, addr);
+		p4d = p4d_offset(pgd, addr);
+		pud = pud_offset(p4d, addr);
+		pmd = pmd_offset(pud, addr);
+
+		/* All levels must exist after apply_to_page_range */
+		if (p4d_none(*p4d) || pud_none(*pud) ||
+		    pmd_none(*pmd)) {
+			pr_err("ptemap: missing page table at 0x%lx\n", addr);
+			return -ENXIO;
+		}
+
+		pfn = page_to_pfn(g_state.pages[i]);
+		new_pmd = pmd_mkhuge(pfn_pmd(pfn, g_state.page_pgprot[i]));
+
+		/*
+		 * Save the old PMD before overwriting — apply_to_page_range()
+		 * put a PTE-table entry here that we must free to avoid leaking
+		 * the PTE page and its pgtables_bytes charge.
+		 */
+		{
+			pmd_t old_pmd = *pmd;
+
+			set_pmd_at(vma->vm_mm, addr, pmd, new_pmd);
+
+			if (!pmd_none(old_pmd) && !pmd_leaf(old_pmd)) {
+				__free_page(pmd_page(old_pmd));
+				mm_dec_nr_ptes(vma->vm_mm);
+			}
+		}
+	}
+
+	g_state.vaddr_start = vma->vm_start;
+	g_state.vaddr_end   = vma->vm_end;
+	g_state.vaddr_size  = vma->vm_end - vma->vm_start;
+
+	if (!g_state.mapped_mm) {
+		mmgrab(vma->vm_mm);
+		g_state.mapped_mm = vma->vm_mm;
+	}
+
+	pr_info("ptemap: mmap HUGE OK: vaddr=0x%lx-0x%lx huge_pages=%lu pid=%d\n",
+		vma->vm_start, vma->vm_end, nr_huge, current->pid);
+
+	return 0;
+}
+
+/*
  * Flush TLB for a virtual address range on the local CPU.
  *
  * On x86, only __flush_tlb_all() is exported to modules (EXPORT_SYMBOL_GPL).
@@ -158,6 +274,58 @@ void ptemap_flush_tlb_range(unsigned long start, unsigned long end)
 {
 	__flush_tlb_all();
 	g_state.tlb_flush_count++;
+}
+
+/*
+ * Walk the page table and clear all PMD-level huge page entries in
+ * [start, end), then flush TLB.
+ *
+ * Counterpart to ptemap_pte_clear_range() for 2MB huge pages.  Walks by
+ * PMD_SIZE stride, checks pmd_leaf() to avoid touching 4KB-page subtrees,
+ * and calls pmd_clear() for each huge mapping found.
+ */
+void ptemap_huge_clear_range(struct mm_struct *mm, unsigned long start,
+			     unsigned long end)
+{
+	unsigned long addr;
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+	pmd_t *pmd;
+	int cleared = 0;
+
+	if (!mm || start >= end)
+		return;
+
+	if (down_write_trylock(&mm->mmap_lock)) {
+		for (addr = start; addr < end; addr += PMD_SIZE) {
+			pgd = pgd_offset(mm, addr);
+			if (pgd_none(*pgd) || pgd_bad(*pgd))
+				continue;
+
+			p4d = p4d_offset(pgd, addr);
+			if (p4d_none(*p4d) || p4d_bad(*p4d))
+				continue;
+
+			pud = pud_offset(p4d, addr);
+			if (pud_none(*pud) || pud_bad(*pud))
+				continue;
+
+			pmd = pmd_offset(pud, addr);
+			if (!pmd || pmd_none(*pmd) || !pmd_leaf(*pmd))
+				continue;
+
+			pmd_clear(pmd);
+			cleared++;
+		}
+		up_write(&mm->mmap_lock);
+	}
+
+	if (cleared > 0) {
+		__flush_tlb_all();
+		pr_info("ptemap: cleared %d PMD mappings + TLB flush (range 0x%lx-0x%lx)\n",
+			cleared, start, end);
+	}
 }
 
 /*
@@ -196,7 +364,7 @@ void ptemap_pte_clear_range(struct mm_struct *mm, unsigned long start,
 	 * is inherently racy; the PTE clear + TLB flush still closes the
 	 * window for subsequent accesses).
 	 */
-	if (mmap_write_trylock(mm)) {
+	if (down_write_trylock(&mm->mmap_lock)) {
 		for (addr = start; addr < end; addr += PAGE_SIZE) {
 			pgd = pgd_offset(mm, addr);
 			if (pgd_none(*pgd) || pgd_bad(*pgd))
@@ -214,6 +382,12 @@ void ptemap_pte_clear_range(struct mm_struct *mm, unsigned long start,
 			if (pmd_none(*pmd) || pmd_bad(*pmd))
 				continue;
 
+			/* Skip PMD-level huge pages — handled by
+			 * ptemap_huge_clear_range() instead.
+			 */
+			if (pmd_leaf(*pmd))
+				continue;
+
 			pte = pte_offset_kernel(pmd, addr);
 			if (!pte || pte_none(*pte))
 				continue;
@@ -221,7 +395,7 @@ void ptemap_pte_clear_range(struct mm_struct *mm, unsigned long start,
 			pte_clear(mm, addr, pte);
 			cleared++;
 		}
-		mmap_write_unlock(mm);
+		up_write(&mm->mmap_lock);
 	}
 
 	if (cleared > 0) {

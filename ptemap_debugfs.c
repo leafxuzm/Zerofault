@@ -21,8 +21,9 @@ static const char * const cache_names[] = {
 static int ptemap_status_show(struct seq_file *m, void *v)
 {
 	seq_printf(m, "state:     LIVE\n");
-	seq_printf(m, "version:   1.3.1\n");
-	seq_printf(m, "pages:     %lu (total)\n", g_state.nr_pages);
+	seq_printf(m, "version:   1.4.0\n");
+	seq_printf(m, "pages:     %lu (total, %lu KB each)\n",
+		   g_state.nr_pages, g_state.page_size / 1024);
 	seq_printf(m, "size:      %lu bytes (%lu MB)\n",
 		   g_state.vaddr_size,
 		   g_state.vaddr_size / (1024 * 1024));
@@ -69,11 +70,12 @@ static int ptemap_mappings_show(struct seq_file *m, void *v)
 		if (g_state.pages[i]) {
 			pfn = page_to_pfn(g_state.pages[i]);
 		}
-		if (g_state.vaddr_start && i < g_state.vaddr_size >> PAGE_SHIFT)
-			vaddr = g_state.vaddr_start + (i << PAGE_SHIFT);
+		if (g_state.vaddr_start && i < g_state.vaddr_size / g_state.page_size)
+			vaddr = g_state.vaddr_start + (i * g_state.page_size);
 
 		seq_printf(m, "%-5lu 0x%016lx 0x%016lx %-10s\n",
-			   i, vaddr, pfn, "4KB");
+			   i, vaddr, pfn,
+			   g_state.page_size == PMD_SIZE ? "2MB" : "4KB");
 	}
 	return 0;
 }
@@ -94,12 +96,14 @@ static const struct file_operations ptemap_mappings_fops = {
 /* /sys/kernel/debug/ptemap/stats */
 static int ptemap_stats_show(struct seq_file *m, void *v)
 {
-	unsigned long total_bytes = g_state.nr_pages * PAGE_SIZE;
+	unsigned long total_bytes = g_state.nr_pages * g_state.page_size;
 
 	seq_printf(m, "total_bytes:    %lu (%lu MB)\n",
 		   total_bytes, total_bytes / (1024 * 1024));
 	seq_printf(m, "nr_pages:       %lu\n", g_state.nr_pages);
-	seq_printf(m, "page_size:      %lu\n", PAGE_SIZE);
+	seq_printf(m, "page_size:      %lu (%s)\n",
+		   g_state.page_size,
+		   g_state.page_size == PMD_SIZE ? "2MB" : "4KB");
 	seq_printf(m, "tlb_flush_count: %lu\n", g_state.tlb_flush_count);
 	return 0;
 }

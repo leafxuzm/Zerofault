@@ -10,7 +10,7 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("PTE direct-mapping module for HFT low-latency memory access");
 MODULE_AUTHOR("Leaf Xu");
-MODULE_VERSION("1.3.1");
+MODULE_VERSION("1.4.0");
 
 /* Module parameters */
 static int phys_pages = 256;
@@ -20,6 +20,10 @@ MODULE_PARM_DESC(phys_pages, "Number of 4KB physical pages to allocate (default:
 static int target_pid;
 module_param(target_pid, int, 0644);
 MODULE_PARM_DESC(target_pid, "Target process PID for access control (0 = any process, default: 0)");
+
+static int huge_page;
+module_param(huge_page, int, 0644);
+MODULE_PARM_DESC(huge_page, "Huge page size: 0=4KB (default), 2=2MB PMD-level huge pages");
 
 static int use_direct_pte;
 module_param(use_direct_pte, int, 0644);
@@ -35,7 +39,7 @@ static int __init ptemap_init(void)
 {
 	int ret;
 
-	pr_info("ptemap: loading v1.3.1\n");
+	pr_info("ptemap: loading v1.4.0\n");
 
 	/* [1] Validate and store parameters */
 	if (phys_pages <= 0 || phys_pages > PTEMAP_MAX_PAGES) {
@@ -46,6 +50,23 @@ static int __init ptemap_init(void)
 	g_state.phys_pages = phys_pages;
 	g_state.target_pid = target_pid;
 	g_state.use_direct_pte = use_direct_pte;
+
+	/* Validate huge_page and set page size / order */
+	switch (huge_page) {
+	case 0:
+		g_state.page_size = PAGE_SIZE;
+		g_state.page_order = 0;
+		break;
+	case 2:
+		g_state.page_size = PMD_SIZE;
+		g_state.page_order = HPAGE_PMD_ORDER;
+		break;
+	default:
+		pr_err("ptemap: huge_page=%d invalid (use 0=4KB or 2=2MB)\n",
+		       huge_page);
+		return -EINVAL;
+	}
+	g_state.huge_page = huge_page;
 
 	/* [2] If target_pid specified, verify process exists */
 	if (target_pid > 0) {
@@ -79,7 +100,7 @@ static int __init ptemap_init(void)
 	/* [3] Allocate physical pages */
 	pr_info("ptemap: allocating %d pages (%lu KB)...\n",
 		g_state.phys_pages,
-		(g_state.phys_pages * PAGE_SIZE) / 1024);
+		(g_state.phys_pages * g_state.page_size) / 1024);
 
 	ret = ptemap_alloc_pages();
 	if (ret) {
@@ -139,9 +160,14 @@ static void __exit ptemap_exit(void)
 	 */
 	if (g_state.mapped_mm && g_state.vaddr_start && g_state.vaddr_end) {
 		if (mmget_not_zero(g_state.mapped_mm)) {
-			ptemap_pte_clear_range(g_state.mapped_mm,
-					       g_state.vaddr_start,
-					       g_state.vaddr_end);
+			if (g_state.huge_page == 2)
+				ptemap_huge_clear_range(g_state.mapped_mm,
+							g_state.vaddr_start,
+							g_state.vaddr_end);
+			else
+				ptemap_pte_clear_range(g_state.mapped_mm,
+						       g_state.vaddr_start,
+						       g_state.vaddr_end);
 			mmput(g_state.mapped_mm);
 		}
 		mmdrop(g_state.mapped_mm);

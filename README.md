@@ -4,8 +4,8 @@
 
 [![Linux](https://img.shields.io/badge/Linux-6.16.2-blue)](https://kernel.org)
 [![License](https://img.shields.io/badge/license-GPL--2.0-green)](LICENSE)
-[![LOC](https://img.shields.io/badge/lines-1560-lightgrey)]()
-[![Version](https://img.shields.io/badge/version-v1.3.1-brightgreen)]()
+[![LOC](https://img.shields.io/badge/lines-1820-lightgrey)]()
+[![Version](https://img.shields.io/badge/version-v1.4.0-brightgreen)]()
 
 ---
 
@@ -116,15 +116,15 @@ sequenceDiagram
 
 | 文件 | 行数 | 职责 |
 |------|------|------|
-| `ptemap_main.c` | 177 | 模块生命周期：init 参数校验 → 找目标进程 → 分配页+缓存数组 → 注册 cdev → 创建 debugfs；exit 逆序清理 + PTE 回滚 |
-| `ptemap_core.c` | 112 | 物理页管理：预分配/释放 (`alloc_page`+`get_page`/`free_reserved_page`)，Per-page 缓存策略数组分配/释放 |
-| `ptemap_cdev.c` | 299 | `/dev/ptemap` 字符设备：open（访问控制）、mmap（v1.0 `vm_insert_page` / v1.1 `apply_to_page_range`）、ioctl（v1.3 QUERY/QUERY_RANGE/FLUSH_TLB） |
-| `ptemap_pte.c` | 232 | v1.1 PTE 直写 + v1.2 逐页 cache 策略 + v1.3 TLB flush + v1.3.1 PTE 清除/回滚 |
-| `ptemap_debugfs.c` | 265 | 4 个 debugfs 文件：`status`、`mappings`、`stats`、`cache_policy`（rw，逐页设置 WC/WB/UC/WT） |
-| `ptemap_core.h` | 92 | 全局状态结构体 + API 声明 + cache 枚举 + 常量 |
-| `ptemap.h` | 88 | UAPI 头文件：ioctl 命令号 + 数据结构，用户态 `#include "ptemap.h"` |
-| `test_ptemap.c` | 295 | 用户态测试：open → mmap → 写/读验证 → 跨页边界 → ioctl QUERY → ioctl QUERY_RANGE → ioctl FLUSH_TLB |
-| **合计** | **1560** | |
+| `ptemap_main.c` | 202 | 模块生命周期：init 参数校验 → 找目标进程 → 分配页+缓存数组 → 注册 cdev → 创建 debugfs；exit 逆序清理 + PTE/PMD 回滚 |
+| `ptemap_core.c` | 147 | 物理页管理：预分配/释放 (`alloc_page`+`get_page`/`free_reserved_page`/`__free_pages`)，Per-page 缓存策略数组，huge page pgprot 转换 |
+| `ptemap_cdev.c` | 314 | `/dev/ptemap` 字符设备：open（访问控制）、mmap（v1.0/v1.1/v1.4 huge 调度）、ioctl（QUERY/QUERY_RANGE/FLUSH_TLB，page_size 感知） |
+| `ptemap_pte.c` | 352 | v1.1 PTE 直写 + v1.2 逐页 cache + v1.3 TLB flush + v1.3.1 PTE 清除 + v1.4 PMD 大页映射与清除 |
+| `ptemap_debugfs.c` | 285 | 4 个 debugfs 文件：`status`、`mappings`、`stats`、`cache_policy`（rw，动态页大小标签） |
+| `ptemap_core.h` | 104 | 全局状态结构体 + API 声明 + cache 枚举 + huge_page/page_size/page_order 字段 |
+| `ptemap.h` | 93 | UAPI 头文件：ioctl 命令号 + 数据结构（含 page_size 输出字段），用户态 `#include "ptemap.h"` |
+| `test_ptemap.c` | 325 | 用户态测试：open → ioctl 检测 page_size → mmap → 写/读验证 → 跨页边界 → ioctl QUERY/QUERY_RANGE/FLUSH_TLB |
+| **合计** | **1820** | |
 
 ## 模块参数
 
@@ -133,6 +133,7 @@ sequenceDiagram
 | `phys_pages` | int | 256 | 预分配物理页数量（256 = 1MB） |
 | `target_pid` | int | 0 | 允许访问的进程 PID（0 = 任意进程） |
 | `use_direct_pte` | int | 0 | PTE 直写模式：0=vm_insert_page(v1.0) 1=apply_to_page_range+set_pte_at(v1.1) |
+| `huge_page` | int | 0 | 大页模式：0=4KB(默认) 2=2MB PMD-level huge pages |
 
 ```sh
 # v1.0 默认路径（vm_insert_page）
@@ -140,6 +141,9 @@ insmod ptemap.ko phys_pages=512 target_pid=0
 
 # v1.1 PTE 直写路径（apply_to_page_range，零 rmap）
 insmod ptemap.ko phys_pages=512 use_direct_pte=1
+
+# v1.4 2MB huge page 路径（PMD 级大页，减少 TLB miss）
+insmod ptemap.ko phys_pages=4 huge_page=2 use_direct_pte=1
 ```
 
 ## 编译 & 测试
@@ -285,11 +289,20 @@ flowchart LR
 | v1.2.1 | 完成 | RSS 计数器修复 (`_PAGE_SPECIAL` bit 9) |
 | v1.3 | 完成 | ioctl 查询接口 (`QUERY`/`QUERY_RANGE`)、运行时 TLB flush (`FLUSH_TLB`/`FLUSH_TLB_RANGE`) |
 | v1.3.1 | 完成 | 修复 `free_reserved_page()` 释放路径（替代手动 `ClearPageReserved+put_page`）、模块卸载 PTE 回滚 + TLB flush 安全机制 |
+| v1.4 | 完成 | 2MB PMD 级 huge page 支持（`apply_to_page_range` 预填充 + `set_pmd_at`）、动态 page_size 检测（ioctl/test/debugfs）、THP 兼容性验证 |
 
-## TODO (v1.4+)
+## 内核配置要求
 
-- [x] **模块卸载安全** — `ptemap_exit()` 回滚 PTE + flush TLB，防止悬挂页表项（v1.3.1）
-- [ ] **Huge page 支持** — 2MB/1GB 大页减少 TLB miss
+| 配置项 | 要求 | 说明 |
+|--------|------|------|
+| `CONFIG_TRANSPARENT_HUGEPAGE` | **强烈建议 `=y`** | 启用后 `zap_huge_pmd()` 正确处理 PMD 大页的 munmap，消除 `bad pmd` 警告。`=n` 时功能同样正常，但 dmesg 会有 4 条 cosmetic 警告 |
+| `CONFIG_TRANSPARENT_HUGEPAGE_MADVISE` | 推荐 | 按需启用 THP，不影响全局其他映射 |
+
+## TODO (v1.5+)
+
+- [x] **模块卸载安全** — `ptemap_exit()` 回滚 PTE/PMD + flush TLB，防止悬挂页表项（v1.3.1/v1.4）
+- [x] **Huge page 支持** — 2MB PMD 级大页，减少 TLB miss（v1.4）
+- [x] **THP 兼容性验证** — `CONFIG_TRANSPARENT_HUGEPAGE=y` 下四个冲突点全部验证通过（v1.4）
 - [ ] **NUMA 感知** — `alloc_page_node()` 按 NUMA node 分配物理页
 - [ ] **insmod 全局 cache_mode 参数** — 设置默认 cache 策略，不必每次通过 debugfs
 - [ ] **多进程共享** — `ptemap_share()` 跨进程 mm 共享

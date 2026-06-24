@@ -43,7 +43,7 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	unsigned long i;
 	unsigned long size = vma->vm_end - vma->vm_start;
-	unsigned long nr_requested = size >> PAGE_SHIFT;
+	unsigned long nr_requested = size / g_state.page_size;
 
 	if (!g_state.pages || g_state.nr_pages == 0) {
 		pr_err("ptemap: no pages available for mmap\n");
@@ -51,16 +51,15 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	}
 
 	if (nr_requested > g_state.nr_pages) {
-		pr_err("ptemap: requested %lu pages, only %lu available\n",
-		       nr_requested, g_state.nr_pages);
+		pr_err("ptemap: requested %lu pages (%lu KB), only %lu available\n",
+		       nr_requested, size / 1024, g_state.nr_pages);
 		return -EINVAL;
 	}
 
-	/*
-	 * Set VMA flags: IO prevents swapping, DONTEXPAND prevents
-	 * mremap from moving the mapping, DONTDUMP excludes from
-	 * core dumps (performance-sensitive memory).
-	 */
+	/* v1.4: 2MB huge page path — manual PGD→P4D→PUD→PMD walk */
+	if (g_state.huge_page == 2)
+		return ptemap_mmap_huge(vma);
+
 	/* v1.1: PTE 直写路径 — apply_to_page_range + set_pte_at，完全绕过
 	 * vm_insert_page / remap_pfn_range，零 rmap 开销，逐页可独立 pgprot */
 	if (g_state.use_direct_pte)
@@ -119,7 +118,7 @@ static int ptemap_ioctl_query(unsigned long arg)
 
 	/* VA */
 	if (g_state.vaddr_start)
-		req.vaddr = g_state.vaddr_start + ((unsigned long)req.page_idx << PAGE_SHIFT);
+		req.vaddr = g_state.vaddr_start + (unsigned long)req.page_idx * g_state.page_size;
 	else
 		req.vaddr = 0;
 
@@ -128,6 +127,9 @@ static int ptemap_ioctl_query(unsigned long arg)
 		req.cache_mode = g_state.page_cache[req.page_idx];
 	else
 		req.cache_mode = PTEMAP_CACHE_WC;
+
+	/* Page size */
+	req.page_size = g_state.page_size;
 
 	if (copy_to_user((void __user *)arg, &req, sizeof(req)))
 		return -EFAULT;
@@ -177,7 +179,7 @@ static int ptemap_ioctl_query_range(unsigned long arg)
 			? page_to_pfn(g_state.pages[i]) : 0;
 
 		va_kern[idx] = g_state.vaddr_start
-			? g_state.vaddr_start + (i << PAGE_SHIFT) : 0;
+			? g_state.vaddr_start + (i * g_state.page_size) : 0;
 
 		cache_kern[idx] = g_state.page_cache
 			? g_state.page_cache[i] : PTEMAP_CACHE_WC;

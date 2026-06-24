@@ -21,8 +21,10 @@
 #include "ptemap.h"
 
 #define DEVICE      "/dev/ptemap"
-#define PAGE_SIZE   4096
 #define DEFAULT_NR  64
+#define PMD_SIZE_2MB (2UL * 1024 * 1024)
+
+static unsigned long page_size = 4096;  /* detected at runtime via ioctl */
 
 static int test_ioctl_query(int fd, unsigned long nr_pages)
 {
@@ -129,9 +131,9 @@ static int test_ioctl_query_range(int fd, unsigned long nr_pages)
 		}
 	}
 
-	/* VA consistency: adjacent pages differ by PAGE_SIZE */
+	/* VA consistency: adjacent pages differ by page_size */
 	for (i = 1; i < nr_pages; i++) {
-		if (va_buf[i] != va_buf[i-1] + PAGE_SIZE) {
+		if (va_buf[i] != va_buf[i-1] + page_size) {
 			fprintf(stderr, "  FAIL VA gap page[%lu]: %llx vs %llx\n",
 				i, (unsigned long long)va_buf[i],
 				(unsigned long long)va_buf[i-1]);
@@ -191,11 +193,9 @@ int main(int argc, char **argv)
 	if (argc > 1)
 		nr_pages = strtoul(argv[1], NULL, 0);
 
-	map_size = nr_pages * PAGE_SIZE;
-
 	printf("=== ptemap test ===\n");
 	printf("device:    %s\n", DEVICE);
-	printf("nr_pages:  %lu (%lu KB)\n", nr_pages, map_size / 1024);
+	printf("nr_pages:  %lu\n", nr_pages);
 
 	/* [1] Open */
 	fd = open(DEVICE, O_RDWR);
@@ -204,6 +204,19 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	printf("[1] open  OK (fd=%d)\n", fd);
+
+	/* [1.5] Detect actual page size from kernel module */
+	{
+		struct ptemap_query_req req;
+		memset(&req, 0, sizeof(req));
+		req.page_idx = 0;
+		if (ioctl(fd, PTEMAP_IOC_QUERY, &req) == 0 && req.page_size > 0)
+			page_size = req.page_size;
+	}
+	map_size = nr_pages * page_size;
+	printf("[*] page_size=%lu (%s), map_size=%lu KB\n",
+	       page_size, page_size >= PMD_SIZE_2MB ? "2MB" : "4KB",
+	       map_size / 1024);
 
 	/* [2] mmap */
 	buf = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
@@ -218,7 +231,7 @@ int main(int argc, char **argv)
 	/* [3] Write pattern: page[i] gets value i at first word */
 	printf("[3] writing pattern...\n");
 	for (i = 0; i < nr_pages; i++) {
-		unsigned long *ptr = (unsigned long *)((char *)buf + i * PAGE_SIZE);
+		unsigned long *ptr = (unsigned long *)((char *)buf + i * page_size);
 		ptr[0] = i;           /* page index */
 		ptr[1] = 0xDEADBEEF;  /* magic */
 		ptr[2] = i * 2;       /* double-check value */
@@ -228,7 +241,7 @@ int main(int argc, char **argv)
 	/* [4] Read back and verify */
 	printf("[4] verifying...\n");
 	for (i = 0; i < nr_pages; i++) {
-		unsigned long *ptr = (unsigned long *)((char *)buf + i * PAGE_SIZE);
+		unsigned long *ptr = (unsigned long *)((char *)buf + i * page_size);
 
 		if (ptr[0] != i) {
 			fprintf(stderr, "  FAIL page[%lu]: expected %lu, got %lu\n",
@@ -254,8 +267,8 @@ int main(int argc, char **argv)
 	/* [5] Cross-page write: ensure adjacent pages don't interfere */
 	printf("[5] cross-page boundary test...\n");
 	for (i = 1; i < nr_pages; i++) {
-		unsigned long *prev_last = (unsigned long *)((char *)buf + i * PAGE_SIZE - sizeof(unsigned long));
-		unsigned long *curr_first = (unsigned long *)((char *)buf + i * PAGE_SIZE);
+		unsigned long *prev_last = (unsigned long *)((char *)buf + i * page_size - sizeof(unsigned long));
+		unsigned long *curr_first = (unsigned long *)((char *)buf + i * page_size);
 		unsigned long saved_prev = *prev_last;
 		unsigned long saved_curr = *curr_first;
 
