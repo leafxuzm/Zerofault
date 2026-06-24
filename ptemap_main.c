@@ -29,10 +29,15 @@ static int use_direct_pte;
 module_param(use_direct_pte, int, 0644);
 MODULE_PARM_DESC(use_direct_pte, "Use PTE direct write (1) instead of vm_insert_page (0, default)");
 
+static char *default_cache = "WC";
+module_param(default_cache, charp, 0644);
+MODULE_PARM_DESC(default_cache, "Default cache mode for all pages: WC (default), WB, UC, WT");
+
 /* Global module state */
 struct ptemap_state g_state = {
 	.phys_pages = 256,
 	.target_pid = 0,
+	.default_cache_mode = PTEMAP_CACHE_WC,
 };
 
 static int __init ptemap_init(void)
@@ -50,6 +55,14 @@ static int __init ptemap_init(void)
 	g_state.phys_pages = phys_pages;
 	g_state.target_pid = target_pid;
 	g_state.use_direct_pte = use_direct_pte;
+
+	/* Validate default_cache and store */
+	if (ptemap_cache_mode_from_name(default_cache,
+					 &g_state.default_cache_mode)) {
+		pr_err("ptemap: default_cache=%s invalid (use WC, WB, UC, WT)\n",
+		       default_cache);
+		return -EINVAL;
+	}
 
 	/* Validate huge_page and set page size / order */
 	switch (huge_page) {

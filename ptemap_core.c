@@ -6,6 +6,7 @@
 #include <linux/pid.h>
 #include <linux/mm_types.h>
 #include <linux/highmem.h>
+#include <linux/string.h>
 #include "ptemap_core.h"
 
 /*
@@ -75,16 +76,38 @@ void ptemap_free_pages(void)
 	g_state.nr_pages = 0;
 }
 
+/* Look up cache mode enum from name string (case-insensitive) */
+int ptemap_cache_mode_from_name(const char *name,
+				enum ptemap_cache_mode *mode_out)
+{
+	static const char * const names[] = {
+		[PTEMAP_CACHE_WC] = "WC",
+		[PTEMAP_CACHE_WB] = "WB",
+		[PTEMAP_CACHE_UC] = "UC",
+		[PTEMAP_CACHE_WT] = "WT",
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		if (names[i] && strcasecmp(name, names[i]) == 0) {
+			*mode_out = (enum ptemap_cache_mode)i;
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
 /*
  * Allocate per-page cache strategy arrays.
  * page_cache[] — enum, user-settable via debugfs
  * page_pgprot[] — pre-computed pgprot_t, used by the mmap callback
  *
- * Default: all pages start as WC (write-combining).
+ * Default cache mode from g_state.default_cache_mode (insmod param, WC if unset).
  * Must be called after g_state.phys_pages is set.
  */
 int ptemap_alloc_cache_arrays(void)
 {
+	enum ptemap_cache_mode cache = g_state.default_cache_mode;
 	int i;
 
 	g_state.page_cache = kcalloc(g_state.phys_pages,
@@ -100,14 +123,17 @@ int ptemap_alloc_cache_arrays(void)
 		return -ENOMEM;
 	}
 
-	/* Default all pages to WC */
+	/* Default all pages to the configured cache mode */
 	for (i = 0; i < g_state.phys_pages; i++) {
-		g_state.page_cache[i] = PTEMAP_CACHE_WC;
+		g_state.page_cache[i] = cache;
 		g_state.page_pgprot[i] = pgprot_writecombine(PAGE_SHARED);
 	}
 
-	pr_info("ptemap: cache arrays allocated (%d pages, default=WC)\n",
-		g_state.phys_pages);
+	pr_info("ptemap: cache arrays allocated (%d pages, default=%s)\n",
+		g_state.phys_pages,
+		cache == PTEMAP_CACHE_WC ? "WC" :
+		cache == PTEMAP_CACHE_WB ? "WB" :
+		cache == PTEMAP_CACHE_UC ? "UC" : "WT");
 	return 0;
 }
 

@@ -23,10 +23,76 @@
 #define DEVICE      "/dev/ptemap"
 #define DEFAULT_NR  64
 #define PMD_SIZE_2MB (2UL * 1024 * 1024)
+#define CACHE_POLICY_PATH "/sys/kernel/debug/ptemap/cache_policy"
 
 static unsigned long page_size = 4096;  /* detected at runtime via ioctl */
 
-static int test_ioctl_query(int fd, unsigned long nr_pages)
+/*
+ * Read the global default cache mode from debugfs cache_policy.
+ * Parses the first range line from the "per-page detail" section,
+ * which always shows the real cache mode string (WC/WB/UC/WT).
+ *
+ * Returns 0 on success with *mode_out set to the expected cache mode.
+ * Returns -1 if debugfs is not available or parsing fails.
+ */
+static int read_expected_cache_from_debugfs(unsigned int *mode_out)
+{
+	FILE *fp;
+	char line[128];
+	unsigned int mode = PTEMAP_CACHE_NR;
+	int in_detail = 0;
+
+	fp = fopen(CACHE_POLICY_PATH, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		/* Wait for the per-page detail section */
+		if (!in_detail) {
+			if (strstr(line, "per-page detail"))
+				in_detail = 1;
+			continue;
+		}
+
+		/* Skip the detail header lines */
+		if (strstr(line, "range") || strstr(line, "----"))
+			continue;
+
+		/* First data line: extract last whitespace-delimited token */
+		{
+			char *tok = strtok(line, " \t\n");
+			char *last = tok;
+
+			while (tok) {
+				last = tok;
+				tok = strtok(NULL, " \t\n");
+			}
+
+			if (last) {
+				if (strcmp(last, "WC") == 0)
+					mode = PTEMAP_CACHE_WC;
+				else if (strcmp(last, "WB") == 0)
+					mode = PTEMAP_CACHE_WB;
+				else if (strcmp(last, "UC") == 0)
+					mode = PTEMAP_CACHE_UC;
+				else if (strcmp(last, "WT") == 0)
+					mode = PTEMAP_CACHE_WT;
+			}
+		}
+		break;
+	}
+
+	fclose(fp);
+
+	if (mode < PTEMAP_CACHE_NR) {
+		*mode_out = mode;
+		return 0;
+	}
+	return -1;
+}
+
+static int test_ioctl_query(int fd, unsigned long nr_pages,
+			    unsigned int expected_cache)
 {
 	unsigned long i, errors = 0;
 
@@ -56,10 +122,10 @@ static int test_ioctl_query(int fd, unsigned long nr_pages)
 		       i, (unsigned long long)req.pfn,
 		       (unsigned long long)req.vaddr, req.cache_mode);
 
-		/* Default cache mode should be WC=0 */
-		if (req.cache_mode != PTEMAP_CACHE_WC) {
-			fprintf(stderr, "  FAIL page[%lu]: expected cache=WC, got %u\n",
-				i, req.cache_mode);
+		/* Compare against real expected cache from debugfs */
+		if (req.cache_mode != expected_cache) {
+			fprintf(stderr, "  FAIL page[%lu]: expected cache=%u, got %u\n",
+				i, expected_cache, req.cache_mode);
 			errors++;
 		}
 
@@ -82,7 +148,8 @@ static int test_ioctl_query(int fd, unsigned long nr_pages)
 	return errors ? 1 : 0;
 }
 
-static int test_ioctl_query_range(int fd, unsigned long nr_pages)
+static int test_ioctl_query_range(int fd, unsigned long nr_pages,
+				  unsigned int expected_cache)
 {
 	struct ptemap_query_range_req req;
 	__u64 *pfn_buf, *va_buf;
@@ -123,10 +190,9 @@ static int test_ioctl_query_range(int fd, unsigned long nr_pages)
 			fprintf(stderr, "  FAIL page[%lu]: VA is 0\n", i);
 			errors++;
 		}
-		if (cache_buf[i] != PTEMAP_CACHE_WC && cache_buf[i] != PTEMAP_CACHE_WB &&
-		    cache_buf[i] != PTEMAP_CACHE_UC && cache_buf[i] != PTEMAP_CACHE_WT) {
-			fprintf(stderr, "  FAIL page[%lu]: invalid cache mode %u\n",
-				i, cache_buf[i]);
+		if (cache_buf[i] != expected_cache) {
+			fprintf(stderr, "  FAIL page[%lu]: expected cache=%u, got %u\n",
+				i, expected_cache, cache_buf[i]);
 			errors++;
 		}
 	}
@@ -189,6 +255,7 @@ int main(int argc, char **argv)
 	unsigned long nr_pages = DEFAULT_NR;
 	unsigned long map_size;
 	unsigned long *buf;
+	unsigned int expected_cache = PTEMAP_CACHE_WC;  /* default fallback */
 
 	if (argc > 1)
 		nr_pages = strtoul(argv[1], NULL, 0);
@@ -227,6 +294,15 @@ int main(int argc, char **argv)
 	}
 	printf("[2] mmap OK (vaddr=%p, size=%lu KB)\n",
 	       (void *)buf, map_size / 1024);
+
+	/* [2.5] Read expected cache mode from debugfs (authoritative source) */
+	if (read_expected_cache_from_debugfs(&expected_cache) == 0) {
+		static const char * const mode_names[] = {"WC", "WB", "UC", "WT"};
+		printf("[*] expected_cache=%s (from debugfs)\n",
+		       mode_names[expected_cache]);
+	} else {
+		printf("[*] expected_cache fallback (debugfs not available)\n");
+	}
 
 	/* [3] Write pattern: page[i] gets value i at first word */
 	printf("[3] writing pattern...\n");
@@ -290,10 +366,10 @@ int main(int argc, char **argv)
 
 	/* [6] ioctl QUERY single-page */
 	ret = errors ? 1 : 0;
-	ret |= test_ioctl_query(fd, nr_pages);
+	ret |= test_ioctl_query(fd, nr_pages, expected_cache);
 
 	/* [7] ioctl QUERY_RANGE batch */
-	ret |= test_ioctl_query_range(fd, nr_pages);
+	ret |= test_ioctl_query_range(fd, nr_pages, expected_cache);
 
 	/* [8] ioctl FLUSH_TLB */
 	ret |= test_ioctl_flush_tlb(fd);

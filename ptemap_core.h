@@ -63,6 +63,9 @@ struct ptemap_state {
 	unsigned long page_size; /* 4096 or 2MB */
 	int page_order;		/* 0 for 4KB, 9 for 2MB */
 
+	/* Default cache mode (set via insmod default_cache=) */
+	enum ptemap_cache_mode default_cache_mode;
+
 	/* PTE direct write */
 	int use_direct_pte;
 
@@ -79,6 +82,8 @@ int ptemap_alloc_cache_arrays(void);
 void ptemap_free_cache_arrays(void);
 void ptemap_free_pages(void);
 void ptemap_free_single_page_range(int start, int nr);
+int ptemap_cache_mode_from_name(const char *name,
+				enum ptemap_cache_mode *mode);
 
 /* ptemap_pte.c — PTE 直写（apply_to_page_range + set_pte_at + pfn_pte） */
 int ptemap_mmap_direct(struct vm_area_struct *vma);

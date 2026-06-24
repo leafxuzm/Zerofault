@@ -134,6 +134,7 @@ sequenceDiagram
 | `target_pid` | int | 0 | 允许访问的进程 PID（0 = 任意进程） |
 | `use_direct_pte` | int | 0 | PTE 直写模式：0=vm_insert_page(v1.0) 1=apply_to_page_range+set_pte_at(v1.1) |
 | `huge_page` | int | 0 | 大页模式：0=4KB(默认) 2=2MB PMD-level huge pages |
+| `default_cache` | string | WC | 全局默认 cache 策略：WC(默认), WB, UC, WT |
 
 ```sh
 # v1.0 默认路径（vm_insert_page）
@@ -144,6 +145,9 @@ insmod ptemap.ko phys_pages=512 use_direct_pte=1
 
 # v1.4 2MB huge page 路径（PMD 级大页，减少 TLB miss）
 insmod ptemap.ko phys_pages=4 huge_page=2 use_direct_pte=1
+
+# v1.5 全局默认 WB cache（免除 debugfs 手动设置）
+insmod ptemap.ko phys_pages=256 default_cache=WB use_direct_pte=1
 ```
 
 ## 编译 & 测试
@@ -290,6 +294,7 @@ flowchart LR
 | v1.3 | 完成 | ioctl 查询接口 (`QUERY`/`QUERY_RANGE`)、运行时 TLB flush (`FLUSH_TLB`/`FLUSH_TLB_RANGE`) |
 | v1.3.1 | 完成 | 修复 `free_reserved_page()` 释放路径（替代手动 `ClearPageReserved+put_page`）、模块卸载 PTE 回滚 + TLB flush 安全机制 |
 | v1.4 | 完成 | 2MB PMD 级 huge page 支持（`apply_to_page_range` 预填充 + `set_pmd_at`）、动态 page_size 检测（ioctl/test/debugfs）、THP 兼容性验证 |
+| v1.5 | 进行中 | insmod `default_cache` 参数（WC/WB/UC/WT）、NUMA 感知、多进程共享 |
 
 ## 内核配置要求
 
@@ -304,7 +309,7 @@ flowchart LR
 - [x] **Huge page 支持** — 2MB PMD 级大页，减少 TLB miss（v1.4）
 - [x] **THP 兼容性验证** — `CONFIG_TRANSPARENT_HUGEPAGE=y` 下四个冲突点全部验证通过（v1.4）
 - [ ] **NUMA 感知** — `alloc_page_node()` 按 NUMA node 分配物理页
-- [ ] **insmod 全局 cache_mode 参数** — 设置默认 cache 策略，不必每次通过 debugfs
+- [x] **insmod 全局 cache_mode 参数** — `default_cache=WC/WB/UC/WT` 参数，免除每次 debugfs 设置（v1.5）
 - [ ] **多进程共享** — `ptemap_share()` 跨进程 mm 共享
 - [ ] **性能基准报告** — mmap 延迟对比、读写吞吐、TLB miss rate
 

@@ -28,6 +28,7 @@ enum ptemap_cache_mode_user {
 	PTEMAP_CACHE_WB = 1,
 	PTEMAP_CACHE_UC = 2,
 	PTEMAP_CACHE_WT = 3,
+	PTEMAP_CACHE_NR = 4,
 };
 #endif
 
