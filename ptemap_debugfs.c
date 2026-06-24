@@ -104,6 +104,9 @@ static int ptemap_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "page_size:      %lu (%s)\n",
 		   g_state.page_size,
 		   g_state.page_size == PMD_SIZE ? "2MB" : "4KB");
+	seq_printf(m, "alloc_time_ns:  %lu\n", g_state.alloc_time_ns);
+	seq_printf(m, "mmap_time_ns:   %lu\n", g_state.mmap_time_ns);
+	seq_printf(m, "mmap_count:     %lu\n", g_state.mmap_count);
 	seq_printf(m, "tlb_flush_count: %lu\n", g_state.tlb_flush_count);
 	return 0;
 }

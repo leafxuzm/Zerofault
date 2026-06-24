@@ -116,6 +116,7 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	unsigned long i;
 	unsigned long size = vma->vm_end - vma->vm_start;
 	unsigned long nr_requested = size / g_state.page_size;
+	u64 t0;
 	int ret;
 
 	if (!g_state.pages || g_state.nr_pages == 0) {
@@ -129,11 +130,15 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 		return -EINVAL;
 	}
 
+	t0 = ktime_get_ns();
+
 	/* v1.4: 2MB huge page path — manual PGD→P4D→PUD→PMD walk */
 	if (g_state.huge_page == 2) {
 		ret = ptemap_mmap_huge(vma);
-		if (ret == 0)
+		if (ret == 0) {
 			ptemap_track_mapping(filp, vma);
+			goto record;
+		}
 		return ret;
 	}
 
@@ -141,8 +146,10 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	 * vm_insert_page / remap_pfn_range，零 rmap 开销，逐页可独立 pgprot */
 	if (g_state.use_direct_pte) {
 		ret = ptemap_mmap_direct(vma);
-		if (ret == 0)
+		if (ret == 0) {
 			ptemap_track_mapping(filp, vma);
+			goto record;
+		}
 		return ret;
 	}
 
@@ -164,7 +171,12 @@ static int ptemap_mmap(struct file *filp, struct vm_area_struct *vma)
 	ptemap_track_mapping(filp, vma);
 	pr_info("ptemap: mmap OK: vaddr=0x%lx-0x%lx pages=%lu pid=%d\n",
 		vma->vm_start, vma->vm_end, nr_requested, current->pid);
-	return 0;
+	ret = 0;
+
+record:
+	g_state.mmap_time_ns = ktime_get_ns() - t0;
+	g_state.mmap_count++;
+	return ret;
 }
 
 /*

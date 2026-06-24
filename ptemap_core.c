@@ -7,6 +7,7 @@
 #include <linux/mm_types.h>
 #include <linux/highmem.h>
 #include <linux/string.h>
+#include <linux/ktime.h>
 #include "ptemap_core.h"
 
 /*
@@ -17,6 +18,9 @@ int ptemap_alloc_pages(void)
 {
 	struct page *page;
 	int i;
+	u64 t0;
+
+	t0 = ktime_get_ns();
 
 	g_state.pages = kcalloc(g_state.phys_pages, sizeof(struct page *),
 				GFP_KERNEL);
@@ -40,6 +44,7 @@ int ptemap_alloc_pages(void)
 	}
 
 	g_state.nr_pages = g_state.phys_pages;
+	g_state.alloc_time_ns = ktime_get_ns() - t0;
 	return 0;
 
 rollback:

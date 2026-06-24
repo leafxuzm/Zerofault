@@ -90,6 +90,8 @@ struct ptemap_state {
 
 	/* Stats */
 	unsigned long alloc_time_ns;
+	unsigned long mmap_time_ns;    /* last mmap call duration */
+	unsigned long mmap_count;      /* number of mmap calls since insmod */
 	unsigned long tlb_flush_count;
 };
 

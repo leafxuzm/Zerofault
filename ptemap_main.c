@@ -43,6 +43,8 @@ struct ptemap_state g_state = {
 	.target_pid = 0,
 	.default_cache_mode = PTEMAP_CACHE_WC,
 	.numa_node = -1,
+	.mmap_time_ns = 0,
+	.mmap_count   = 0,
 };
 
 static int __init ptemap_init(void)
