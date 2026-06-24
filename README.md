@@ -5,7 +5,7 @@
 [![Linux](https://img.shields.io/badge/Linux-6.16.2-blue)](https://kernel.org)
 [![License](https://img.shields.io/badge/license-GPL--2.0-green)](LICENSE)
 [![LOC](https://img.shields.io/badge/lines-1820-lightgrey)]()
-[![Version](https://img.shields.io/badge/version-v1.4.0-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-v1.5.0-brightgreen)]()
 
 ---
 
@@ -298,7 +298,7 @@ flowchart LR
 | v1.3 | 完成 | ioctl 查询接口 (`QUERY`/`QUERY_RANGE`)、运行时 TLB flush (`FLUSH_TLB`/`FLUSH_TLB_RANGE`) |
 | v1.3.1 | 完成 | 修复 `free_reserved_page()` 释放路径（替代手动 `ClearPageReserved+put_page`）、模块卸载 PTE 回滚 + TLB flush 安全机制 |
 | v1.4 | 完成 | 2MB PMD 级 huge page 支持（`apply_to_page_range` 预填充 + `set_pmd_at`）、动态 page_size 检测（ioctl/test/debugfs）、THP 兼容性验证 |
-| v1.5 | 进行中 | insmod `default_cache` 参数（WC/WB/UC/WT）、NUMA 感知（`alloc_pages_node`）、多进程共享 |
+| v1.5 | 完成 | insmod `default_cache` 参数（WC/WB/UC/WT）、NUMA 感知（`alloc_pages_node`）、多进程共享（per-open 区域追踪 + ioctl 进程感知 VA） |
 
 ## 内核配置要求
 
@@ -314,7 +314,7 @@ flowchart LR
 - [x] **THP 兼容性验证** — `CONFIG_TRANSPARENT_HUGEPAGE=y` 下四个冲突点全部验证通过（v1.4）
 - [x] **NUMA 感知** — `alloc_pages_node()` 按 NUMA node 分配物理页（v1.5）
 - [x] **insmod 全局 cache_mode 参数** — `default_cache=WC/WB/UC/WT` 参数，免除每次 debugfs 设置（v1.5）
-- [ ] **多进程共享** — `ptemap_share()` 跨进程 mm 共享
+- [x] **多进程共享** — per-open 区域追踪链表 + spinlock，每个进程独立的 VA 映射到同一组物理页，ioctl 返回进程感知的 VA（v1.5）
 - [ ] **性能基准报告** — mmap 延迟对比、读写吞吐、TLB miss rate
 
 ## License

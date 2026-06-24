@@ -10,7 +10,7 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("PTE direct-mapping module for HFT low-latency memory access");
 MODULE_AUTHOR("Leaf Xu");
-MODULE_VERSION("1.4.0");
+MODULE_VERSION("1.5.0");
 
 /* Module parameters */
 static int phys_pages = 256;
@@ -49,7 +49,7 @@ static int __init ptemap_init(void)
 {
 	int ret;
 
-	pr_info("ptemap: loading v1.4.0\n");
+	pr_info("ptemap: loading v1.5.0\n");
 
 	/* [1] Validate and store parameters */
 	if (phys_pages <= 0 || phys_pages > PTEMAP_MAX_PAGES) {
